@@ -18,8 +18,3 @@ class KivyBootstrap:
         if platform:
             ...
     
-
-
-if __name__ == "__main__":
-    from ...bootstrap import ProjectTest
-    bootstrap: BootstrapProtocol = KivyBootstrap(ProjectTest())

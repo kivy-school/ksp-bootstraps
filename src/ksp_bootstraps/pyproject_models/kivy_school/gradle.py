@@ -1,6 +1,6 @@
-from typing import Protocol
+from typing import Protocol, Sequence, List
 from pathlib import Path
-from enum import Enum
+from enum import Enum, StrEnum
 
 class AndroidProtocol(Protocol):
 
@@ -8,7 +8,7 @@ class AndroidProtocol(Protocol):
     def package_name(self) -> str: ...
 
     @property 
-    def archs(self) ->  list["Arch"]: ...
+    def archs(self) ->  Sequence[StrEnum]: ...
 
     @property 
     def api(self) ->  int | None: ...
@@ -53,7 +53,7 @@ class AndroidProtocol(Protocol):
     def presplash_lottie(self) -> str | None: ...
     
     @property 
-    def permissions(self) -> list[str]: ...
+    def permissions(self) -> Sequence[str]: ...
     
     @property 
     def meta_data(self) -> dict[str, str]: ...
@@ -65,7 +65,7 @@ class AndroidProtocol(Protocol):
     def gradle_plugins(self) -> list[str]: ...
     
     @property 
-    def services(self) -> list["ServiceData"]: ...
+    def services(self) -> Sequence["ServiceData"]: ...
     
     @property 
     def version_code(self) -> int: ...
@@ -74,7 +74,7 @@ class AndroidProtocol(Protocol):
     def version_name(self) -> str: ...
     
     @property 
-    def include_files(self) -> list[tuple[str, list[str]]]: ...
+    def include_files(self) -> Sequence[tuple[str, list[str]]]: ...
 
     @property 
     def pre_build(self) -> Path | None: ...
@@ -85,9 +85,9 @@ class AndroidProtocol(Protocol):
     def kivyschool_root(self, working_dir: Path) -> Path: ...
 
 
-    class Arch(Enum):
-        ARM64_V8A = "arm64-v8a"
-        X86_64 = "x86_64"
+    # class Arch(Enum):
+    #     ARM64_V8A = "arm64-v8a"
+    #     X86_64 = "x86_64"
         
 
     class ServiceData(Protocol):
