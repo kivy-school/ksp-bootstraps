@@ -7,6 +7,7 @@ import tarfile
 import tempfile
 import urllib.request
 from pathlib import Path
+from enum import StrEnum
 
 from ...platforms import AndroidPlatform
 from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
@@ -14,7 +15,7 @@ from ...pyproject_models.kivy_school.gradle import AndroidProtocol
 from ...bootstrap import ProjectDelegate
 from .gradle_build_files import GradleBuildFiles
 
-Arch = AndroidProtocol.Arch
+#Arch = AndroidProtocol.Arch
 
 
 class KivyGradleBuilder:
@@ -24,10 +25,12 @@ class KivyGradleBuilder:
     def __init__(self, pyproject: PyProjectTomlProtocol, delegate: ProjectDelegate):
         self.pyproject = pyproject
         self.working_dir = delegate.working_dir
-
+        self.delegate = delegate
         kivy_school = pyproject.tool.kivy_school
         if kivy_school is None:
             raise ValueError("[tool.kivy-school] is missing in pyproject.toml")
+        if kivy_school.android is None:
+            raise ValueError("[tool.kivy-school.android] is missing in pyproject.toml")
 
         self.kivy_school = kivy_school
         self.android = kivy_school.android
@@ -37,10 +40,10 @@ class KivyGradleBuilder:
             if self.android and self.android.package_name
             else f"org.kivyschool.{pyproject.project.name.lower()}"
         )
-        self.archs: list[Arch] = (
+        self.archs = (
             self.android.archs
             if self.android and self.android.archs
-            else [Arch.ARM64_V8A, Arch.X86_64]
+            else list[StrEnum]()
         )
         self.ks_root: Path = self.android.kivyschool_root(delegate.working_dir)
 
@@ -72,7 +75,7 @@ class KivyGradleBuilder:
             if not p.is_absolute():
                 p = self.working_dir / p
             return p
-        templates = Path(__file__).parent.parent / "templates"
+        templates = Path(__file__).parent / "templates"
         for ext in ("png", "jpg", "gif", "json"):
             candidate = templates / f"{name}.{ext}"
             if candidate.exists():
@@ -103,7 +106,7 @@ class KivyGradleBuilder:
         )
 
         merged_deps = _merge_unique(base_deps, extra_gradle_dependencies or [])
-        merged_perms = _merge_unique(base_perms, extra_permissions or [])
+        merged_perms = _merge_unique(base_perms, extra_permissions or []) # type: ignore
 
         # Extract version metadata safely out of the parsed configuration object
         v_code = getattr(self.android, "version_code", 1) if self.android else 1
@@ -128,7 +131,7 @@ class KivyGradleBuilder:
             project_dir=self.working_dir,
             app_dir=app_dir,
             package_name=self.package_name,
-            archs=self.archs,
+            archs=self.archs, #type: ignore
             compile_sdk=(
                 self.android.api
                 if self.android and self.android.api
@@ -161,7 +164,7 @@ class KivyGradleBuilder:
             app_name=self.app_name,
             permissions=merged_perms,
             meta_data=(self.android.meta_data if self.android else {}),
-            services=(self.android.services if self.android else []),
+            services=(self.android.services if self.android else []), #type: ignore
         )
         res_dir = main_dir / "res"
         GradleBuildFiles.write_icon(res_dir, self._resolve_asset("icon"))
