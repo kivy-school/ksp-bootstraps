@@ -14,7 +14,11 @@ class KivyBootstrap:
         self.builder = KivyGradleBuilder(py_project, delegate)
 
     def generate(self, **kw):
-        platform: Platform = kw.pop("platform")
+        platform: str = kw.pop("platform")
         if platform:
-            ...
+            match platform:
+                case "android":
+                    self.builder.generate(**kw)
+                case _:
+                    raise NotImplementedError(platform)
     

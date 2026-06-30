@@ -9,13 +9,14 @@ import shutil
 import urllib.request
 import zlib
 from pathlib import Path
+from enum import StrEnum
 
 # from ksproject_utils.pyproject_toml import KivySchoolData
 # from ksproject_utils.gradle.android_toolchain import DEFAULT_API_VERSION
 from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
 from ...pyproject_models.pyproject_toml import KivySchoolProtocol, AndroidProtocol
 
-Arch = AndroidProtocol.Arch
+#Arch = AndroidProtocol.Arch
 
 _GRADLE_VERSION = "9.5.0"
 # Gradle commits the wrapper jar to their own repo; download it directly so
@@ -132,7 +133,7 @@ include(":app")
         project_dir: Path,
         app_dir: Path,
         package_name: str,
-        archs: list[Arch],
+        archs: list[StrEnum],
         compile_sdk: int,
         min_sdk: int,
         target_sdk: int,
