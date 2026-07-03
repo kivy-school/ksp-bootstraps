@@ -12,7 +12,7 @@ from enum import StrEnum
 from ...platforms import AndroidPlatform
 from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
 from ...pyproject_models.kivy_school.gradle import AndroidProtocol
-from ...bootstrap import ProjectDelegate
+from ...bootstrap import GradleProjectDelegate
 from .gradle_build_files import GradleBuildFiles
 
 #Arch = AndroidProtocol.Arch
@@ -20,9 +20,9 @@ from .gradle_build_files import GradleBuildFiles
 
 class KivyGradleBuilder:
 
-    delegate: ProjectDelegate
+    delegate: GradleProjectDelegate
 
-    def __init__(self, pyproject: PyProjectTomlProtocol, delegate: ProjectDelegate):
+    def __init__(self, pyproject: PyProjectTomlProtocol, delegate: GradleProjectDelegate):
         self.pyproject = pyproject
         self.working_dir = delegate.working_dir
         self.delegate = delegate
@@ -123,7 +123,7 @@ class KivyGradleBuilder:
 
         # app module (must exist before `gradle wrapper` evaluates settings.gradle.kts)
         delegate = self.delegate
-        default_api_ver = delegate.android_default_api_version
+        default_api_ver = delegate.default_api_version
         py_version = delegate.py_version
         app_dir = dist_dir / "app"
         app_dir.mkdir(parents=True, exist_ok=True)
@@ -146,13 +146,14 @@ class KivyGradleBuilder:
                 else default_api_ver
             ),
             python_version=py_version,
-            ndk_version=delegate.android_ndk_version,
-            ndk_path=delegate.android_ndk_path,
+            ndk_version=delegate.ndk_version,
+            ndk_path=delegate.ndk_path,
             aar=aar,
             gradle_dependencies=merged_deps,
             version_code=v_code,
             version_name=v_name,
             post_build=(self.android.post_build if self.android else None),
+            byte_compile_default=(self.android.byte_compile_python if self.android else True)
         )
 
         main_dir = app_dir / "src" / "main"
@@ -250,10 +251,10 @@ class KivyGradleBuilder:
         GradleBuildFiles.write_cmake_lists(cpp_dir)
 
         # Generate the wrapper now that the app module exists on disk
-        GradleBuildFiles.write_gradle_wrapper(dist_dir, delegate.android_java_path)
+        GradleBuildFiles.write_gradle_wrapper(dist_dir, delegate.java_path)
 
         # Build CPython for Android (cached in <ks_root>/Python-<ver>/)
-        delegate.install_cpython(AndroidPlatform(str(self.working_dir)))
+        delegate.install_cpython()
         # install_cpython_android(
         #     ks_root=self.ks_root,
         #     archs=[a.value for a in self.archs],

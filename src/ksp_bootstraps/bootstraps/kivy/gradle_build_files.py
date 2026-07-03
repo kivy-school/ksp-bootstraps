@@ -134,8 +134,8 @@ include(":app")
         app_dir: Path,
         package_name: str,
         archs: list[StrEnum],
-        compile_sdk: int,
-        min_sdk: int,
+        compile_sdk: int ,
+        min_sdk: int ,
         target_sdk: int,
         python_version: str = "3.13",
         ndk_version: str | None = None,
@@ -145,6 +145,7 @@ include(":app")
         version_name: str = "1.0",
         version_code: int = 1,
         post_build: Path | None = None,
+        byte_compile_default: bool = False,
     ) -> None:
 
         abi_filters = ", ".join(f'"{a.value}"' for a in archs)
@@ -166,7 +167,7 @@ include(":app")
 
         ndk_path_str = str(ndk_path).replace("\\", "/") if ndk_path else ""
         site_packages_tasks = GradleBuildFiles._site_packages_tasks(
-            arch_list_kts, python_version
+            arch_list_kts, python_version, byte_compile_default
         )
         site_packages_tasks += GradleBuildFiles._post_build_task(post_build)
 
@@ -204,6 +205,11 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            # excludes += setOf(
+            #     "**/libcrypto.so",
+            #     "**/libssl.so",
+            #     "**/libsqlite3.so"
+            # )
         }
     }
 
@@ -236,7 +242,8 @@ android {
 
 dependencies {
     implementation(fileTree("libs") { include("*.aar", "*.jar") })
-{{ extra_deps }}}
+{{ extra_deps }}
+}
 
 {{ site_packages_tasks }}
 """
@@ -311,8 +318,70 @@ tasks.configureEach {{
 // ─────────────────────────────────────────────────────────────────────────────"""
 
     @staticmethod
-    def _site_packages_tasks(arch_list_kts: str, python_version: str) -> str:
+    def _site_packages_tasks(arch_list_kts: str, python_version: str, byte_compile_default: bool) -> str:
+        kt_bool = str(byte_compile_default).lower()
         return f"""\
+abstract class OptimizePythonTask : DefaultTask() {{
+    @get:Input
+    abstract val shouldCompile: Property<Boolean>
+
+    @get:Input
+    abstract val targetPath: Property<String>
+
+    @get:Input
+    abstract val ndkDir: Property<String>
+
+    @TaskAction
+    fun runOptimization() {{
+        val path = targetPath.get()
+        val dir = File(path)
+        if (!dir.exists()) return
+
+        val doCompile = shouldCompile.get()
+
+        if (doCompile) {{
+            ProcessBuilder("python3", "-m", "compileall", "-b", "-o", "2", "-j", "0", "-q", path)
+                .redirectErrorStream(true)
+                .start()
+                .waitFor()
+        }}
+
+        val junkExts = mutableListOf(".pyi", ".c", ".cpp", ".h", ".pyx", ".pxd", ".md", ".rst")
+        if (doCompile) {{
+            junkExts.add(".py")
+        }}
+
+        val junkDirs = setOf("tests", "test", "docs", "doc", "examples", "example", "tutorials", "benchmarks", "perf", ".mypy_cache", ".pytest_cache", "__pycache__", "bin", "unittest")
+        val allFiles = dir.walkBottomUp().toList()
+
+        allFiles.parallelStream().forEach {{ f ->
+            if (f.isFile && junkExts.any {{ ext -> f.name.endsWith(ext) }}) {{
+                f.delete()
+            }}
+        }}
+
+        allFiles.forEach {{ f ->
+            if (f.isDirectory && junkDirs.contains(f.name) && f.exists()) {{
+                f.deleteRecursively()
+            }}
+        }}
+
+        val os = org.gradle.internal.os.OperatingSystem.current()
+        val hostTag = if (os.isWindows) "windows-x86_64" else if (os.isMacOsX) "darwin-x86_64" else "linux-x86_64"
+        val stripExe = if (os.isWindows) "llvm-strip.exe" else "llvm-strip"
+        val stripTool = File(ndkDir.get(), "toolchains/llvm/prebuilt/$hostTag/bin/$stripExe")
+
+        if (stripTool.exists()) {{
+            val soFiles = dir.walkTopDown().filter {{ it.isFile && it.name.endsWith(".so") }}.toList()
+            soFiles.parallelStream().forEach {{ f ->
+                ProcessBuilder(stripTool.absolutePath, "--strip-unneeded", f.absolutePath)
+                    .start()
+                    .waitFor()
+            }}
+        }}
+    }}
+}}
+
 val sitePackagesAbis = listOf({arch_list_kts})
 val stagingDir = layout.buildDirectory.dir("python_assets_staging").get().asFile
 val assetsDir = layout.projectDirectory.dir("src/main/assets")
@@ -339,73 +408,37 @@ val stagePythonTasks = sitePackagesAbis.map {{ abi ->
     }}
 }}
 
-val cleanLegacyPython = tasks.register("cleanLegacyPython") {{
+val cleanLegacyPython = tasks.register<Delete>("cleanLegacyPython") {{
     group = "python"
     dependsOn(stagePythonTasks)
-
-    val assetsPath = assetsDir.asFile.absolutePath
-    doLast {{
-        val aDir = File(assetsPath)
-        File(aDir, "python{python_version}").deleteRecursively()
-        File(aDir, "lib-dynload").deleteRecursively()
-        File(aDir, "site-packages").deleteRecursively()
-    }}
+    delete(
+        assetsDir.dir("python{python_version}"),
+        assetsDir.dir("lib-dynload"),
+        assetsDir.dir("site-packages")
+    )
 }}
 
 val optimizeStagedTasks = sitePackagesAbis.map {{ abi ->
-    tasks.register<Exec>("optimizeStaged_${{abi}}") {{
+    tasks.register<OptimizePythonTask>("optimizeStaged_${{abi}}") {{
         group = "python"
         dependsOn("stagePython_${{abi}}")
 
-        val targetPath = stagingDir.absolutePath
-        val ndkDirPath = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java).ndkDirectory.absolutePath
-
-        onlyIf {{ File(targetPath).exists() }}
-
-        commandLine("python3", "-m", "compileall", "-b", "-o", "2", "-j", "0", "-q", targetPath)
-
-        doLast {{
-            val dir = File(targetPath)
-            if (!dir.exists()) return@doLast
-
-            val junkExts = listOf(".py", ".pyi", ".c", ".cpp", ".h", ".pyx", ".pxd", ".md", ".rst")
-            val junkDirs = setOf("tests", "test", "docs", "doc", "examples", "example", "tutorials", "benchmarks", "perf", ".mypy_cache", ".pytest_cache", "__pycache__")
-
-            val allFiles = dir.walkBottomUp().toList()
-
-            allFiles.parallelStream().forEach {{ f ->
-                if (f.isFile && junkExts.any {{ ext -> f.name.endsWith(ext) }}) {{
-                    f.delete()
-                }}
-            }}
-
-            allFiles.forEach {{ f ->
-                if (f.isDirectory && junkDirs.contains(f.name) && f.exists()) {{
-                    f.deleteRecursively()
-                }}
-            }}
-
-            val os = org.gradle.internal.os.OperatingSystem.current()
-            val hostTag = if (os.isWindows) "windows-x86_64" else if (os.isMacOsX) "darwin-x86_64" else "linux-x86_64"
-            val stripExe = if (os.isWindows) "llvm-strip.exe" else "llvm-strip"
-            val stripTool = File(ndkDirPath, "toolchains/llvm/prebuilt/$hostTag/bin/$stripExe")
-
-            if (stripTool.exists()) {{
-                val soFiles = dir.walkTopDown().filter {{ it.isFile && it.name.endsWith(".so") }}.toList()
-                soFiles.parallelStream().forEach {{ f ->
-                    ProcessBuilder(stripTool.absolutePath, "--strip-unneeded", f.absolutePath)
-                        .start()
-                        .waitFor()
-                }}
-            }}
+        val isCmdLineForced = project.hasProperty("forceCompile")
+        val isReleaseBuild = gradle.startParameter.taskNames.any {{ 
+            it.contains("Release", ignoreCase = true) 
         }}
+        val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
+
+        shouldCompile.set(isReleaseBuild || isCmdLineForced || {kt_bool})
+        targetPath.set(stagingDir.absolutePath)
+        ndkDir.set(androidExt.ndkDirectory.absolutePath)
     }}
 }}
 
 val zipPythonAssets = tasks.register<Zip>("zipPythonAssets") {{
     group = "python"
     dependsOn(optimizeStagedTasks)
-    dependsOn(cleanLegacyPython)
+    dependsOn(cleanLegacyPython) 
 
     archiveFileName.set("assets.zip")
     destinationDirectory.set(assetsDir)
@@ -525,7 +558,6 @@ tasks.configureEach {{
         android:allowBackup="true"
         android:supportsRtl="true"
         android:hardwareAccelerated="true"
-        android:extractNativeLibs="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">{{ meta_data }}
 {{ services }}
         <activity
@@ -685,9 +717,9 @@ public class MainActivity extends PythonActivity {{
                         if (abi == null) {{
                             Log.e(TAG, "Could not find any matching ABI in assets.zip");
                         }}
-
+                        
                         extractZipAsset(getAssets(), "assets.zip", appDir, abi);
-
+                        
                         // Signal to main.c that extraction is complete
                         unpackDoneFile.createNewFile();
                     }} catch (IOException e) {{

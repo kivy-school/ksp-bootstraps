@@ -1,7 +1,7 @@
 from typing import Protocol, Generic
 from pathlib import Path
 
-from .kivy_school.apple import MacOSProtocol, IosProtocol
+from .kivy_school.apple import MacOSProtocol, IosProtocol, AppleProtocol
 from .kivy_school.gradle import AndroidProtocol
 
 class PyProjectProtocol(Protocol):
@@ -19,10 +19,9 @@ class KivySchoolProtocol(Protocol):
     def android(self) -> AndroidProtocol | None: ...
 
     @property
-    def ios(self) -> IosProtocol | None: ...
+    def apple(self) -> AppleProtocol | None: ...
 
-    @property
-    def macos(self) -> MacOSProtocol | None: ...
+    
 
 
 
