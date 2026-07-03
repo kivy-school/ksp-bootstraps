@@ -82,6 +82,9 @@ class AndroidProtocol(Protocol):
     @property 
     def post_build(self) -> Path | None: ...
 
+    @property
+    def byte_compile_python(self) -> bool: ...
+
     def kivyschool_root(self, working_dir: Path) -> Path: ...
 
 
