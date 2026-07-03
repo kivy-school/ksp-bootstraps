@@ -104,10 +104,20 @@ if [ "$CONFIGURATION" = "Release" ]; then
         find "$STRIP_ROOT" -type d -name "__pycache__" -prune -exec rm -rf {} +
     fi
 fi
-""".replace("__PY_VERSION__", f"3.{PY_SUB_VERSION}")
+"""
 
 
-INSTALL_PY_MODULES_SCRIPT = f"""set -e
+def install_py_modules_script(uv_python: str | None = None) -> str:
+    """Render the install/optimize build phase.
+
+    ``uv_python`` is the version pin for the release byte-compile step
+    (exact patch from the project's .python-version when available);
+    defaults to the bundled runtime's major.minor.
+    """
+    optimize = _RELEASE_OPTIMIZE_SITE.replace(
+        "__PY_VERSION__", uv_python or f"3.{PY_SUB_VERSION}"
+    )
+    return f"""set -e
 if [ "$EFFECTIVE_PLATFORM_NAME" = "-iphonesimulator" ] || [ "$EFFECTIVE_PLATFORM_NAME" = "-iphoneos" ]; then
     echo "Installing Python modules for iOS Device/Simulator"
     {_indent(_INSTALL_PY_IOS, "    ")}
@@ -119,7 +129,10 @@ fi
 PYTHON="$PROJECT_DIR/python3"
 PY_APP="$CODESIGNING_FOLDER_PATH/app"
 PY_SITE="$CODESIGNING_FOLDER_PATH/site_packages"
-""" + _RELEASE_OPTIMIZE_SITE
+""" + optimize
+
+
+INSTALL_PY_MODULES_SCRIPT = install_py_modules_script()
 
 
 _SIGN_PY_IOS_BODY = r"""install_dylib () {
@@ -223,7 +236,8 @@ class ProjectTarget:
         entitlements: dict[str, Any] | None,
         site_xcframeworks: list[str] | None = None,
         developer_team: str | None = None,
-        post_build: Path | None = None
+        post_build: Path | None = None,
+        uv_python: str | None = None
     ) -> None:
         self.name = name
         self.info_plist_extra = info_plist_extra
@@ -231,6 +245,7 @@ class ProjectTarget:
         self.site_xcframeworks: list[str] = site_xcframeworks or []
         self.developer_team = developer_team
         self.post_build = post_build
+        self.uv_python = uv_python
 
     # ----- settings -----
 
@@ -335,7 +350,7 @@ class ProjectTarget:
             {"script": INSTALL_APP_MODULE_SCRIPT, "name": "Install App Module"},
             {"script": post_text, "name": "ksproject post-build"},
             {
-                "script": INSTALL_PY_MODULES_SCRIPT,
+                "script": install_py_modules_script(self.uv_python),
                 "name": "Install target specific Python modules",
             },
             {"script": SIGN_PYTHON_BINARY_SCRIPT, "name": "Sign Python Binary Modules"},

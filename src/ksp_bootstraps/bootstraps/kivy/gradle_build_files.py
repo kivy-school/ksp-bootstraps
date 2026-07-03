@@ -146,6 +146,7 @@ include(":app")
         version_code: int = 1,
         post_build: Path | None = None,
         byte_compile_default: bool = False,
+        uv_python: str | None = None,
     ) -> None:
 
         abi_filters = ", ".join(f'"{a.value}"' for a in archs)
@@ -167,7 +168,7 @@ include(":app")
 
         ndk_path_str = str(ndk_path).replace("\\", "/") if ndk_path else ""
         site_packages_tasks = GradleBuildFiles._site_packages_tasks(
-            arch_list_kts, python_version, byte_compile_default
+            arch_list_kts, python_version, byte_compile_default, uv_python
         )
         site_packages_tasks += GradleBuildFiles._post_build_task(post_build)
 
@@ -318,8 +319,17 @@ tasks.configureEach {{
 // ─────────────────────────────────────────────────────────────────────────────"""
 
     @staticmethod
-    def _site_packages_tasks(arch_list_kts: str, python_version: str, byte_compile_default: bool) -> str:
+    def _site_packages_tasks(
+        arch_list_kts: str,
+        python_version: str,
+        byte_compile_default: bool,
+        uv_python: str | None = None,
+    ) -> str:
         kt_bool = str(byte_compile_default).lower()
+        # Byte-compile with a uv-managed interpreter pinned to the bundled
+        # runtime's version so .pyc magic numbers match; bare python3 would
+        # use whatever the host happens to have.
+        uv_py = uv_python or python_version
         return f"""\
 abstract class OptimizePythonTask : DefaultTask() {{
     @get:Input
@@ -340,7 +350,7 @@ abstract class OptimizePythonTask : DefaultTask() {{
         val doCompile = shouldCompile.get()
 
         if (doCompile) {{
-            ProcessBuilder("python3", "-m", "compileall", "-b", "-o", "2", "-j", "0", "-q", path)
+            ProcessBuilder("uv", "run", "--no-project", "--python", "{uv_py}", "python", "-m", "compileall", "-b", "-o", "2", "-j", "0", "-q", path)
                 .redirectErrorStream(true)
                 .start()
                 .waitFor()

@@ -43,9 +43,12 @@ class GradleProjectDelegate(Protocol):
     
     @property
     def java_path(self) -> str: ...
-    
+
     @property
     def android_py_version(self) -> str: ...
+
+    @property
+    def uv_py_version(self) -> str: ...
 
 @runtime_checkable
 class XcodeProjectDelegate(Protocol):
@@ -54,8 +57,11 @@ class XcodeProjectDelegate(Protocol):
     def py_version(self) -> str: ...
 
     @property
+    def uv_py_version(self) -> str: ...
+
+    @property
     def working_dir(self) -> Path: ...
-    
+
     def install_cpython(self): ...
 
     def xcode_generate(self, **kw): ...

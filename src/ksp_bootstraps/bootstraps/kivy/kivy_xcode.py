@@ -179,6 +179,7 @@ class KivyXcodeBuilder:
             entitlements=self.entitlements if self.entitlements else None,
             site_xcframeworks=site_xcframeworks,
             developer_team=self.developer_team,
+            uv_python=getattr(self.delegate, "uv_py_version", None),
         )
         spec = ProjectSpec(
             name=self.app_name,
