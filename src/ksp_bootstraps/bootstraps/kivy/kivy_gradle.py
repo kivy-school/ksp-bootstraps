@@ -312,6 +312,22 @@ class KivyGradleBuilder:
         if not stdlib_dst.exists() and stdlib_src.exists():
             _copy_pure_python(stdlib_src, stdlib_dst)
 
+        # _sysconfigdata / _sysconfig_vars are arch-specific (arch-suffixed
+        # filenames, so they coexist); the stdlib above only carries the first
+        # arch's copy. Python 3.14 imports them via ctypes -> sysconfig at
+        # startup, so every ABI needs its own.
+        if stdlib_dst.exists():
+            for arch in self.archs:
+                arch_prefix = delegate.android_prefix(
+                    self.ks_root, arch.value, delegate.android_py_version
+                )
+                arch_stdlib = arch_prefix / f"lib/python{py_version}"
+                for pattern in ("_sysconfigdata__*", "_sysconfig_vars__*"):
+                    for cfg_file in arch_stdlib.glob(pattern):
+                        dst = stdlib_dst / cfg_file.name
+                        if not dst.exists():
+                            shutil.copy2(cfg_file, dst)
+
         # ------------------------------------------------------------------
         # Process include_files (e.g. google-services.json, *.json)
         # ------------------------------------------------------------------
