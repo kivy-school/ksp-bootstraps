@@ -17,6 +17,7 @@ from ksp_bootstraps.xcode.main_files import render_main_swift
 from ksp_bootstraps.xcode.plist_templates import STDLIB_PLIST_XML
 from ksp_bootstraps.xcode.project_spec import ProjectSpec
 from ksp_bootstraps.xcode.project_target import ProjectTarget
+from ksp_bootstraps.xcode.spec_merge import merge_user_spec
 #from ksp_bootstraps.xcode.python_apple import ApplePythonFramework, apple_python_cache_root
 from ksp_bootstraps.xcode.static_templates import (
     APP_ICON_CONTENTS,
@@ -187,7 +188,7 @@ class KivyXcodeBuilder:
             bundle_id_prefix=self.bundle_id_prefix,
             target=target,
         )
-        return spec.to_dict()
+        return merge_user_spec(spec.to_dict(), self.working_dir)
 
     def _write_spec(self) -> Path:
         spec_path = self.project_dir / "project.yml"
