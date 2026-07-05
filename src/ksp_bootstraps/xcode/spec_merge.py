@@ -1,15 +1,14 @@
-"""Merge a user-provided ``xcode.yaml`` over the generated XcodeGen spec.
+"""Merge a user-provided ``xcode.yaml`` into the generated XcodeGen spec.
 
 Users can drop an ``xcode.yaml`` (or ``xcode.yml``) in the project root to
-extend or override the ``project.yml`` that ksproject generates for XcodeGen.
+add extra entries (packages, dependencies, settings, ...) to the
+``project.yml`` that ksproject generates for XcodeGen.
 
-Merge semantics mirror XcodeGen's own ``include`` behaviour:
+Merge semantics — additive:
 
-- dictionaries merge recursively, with the user value winning on conflicts
+- dictionaries merge recursively
 - lists are appended (generated entries first, then user entries)
-- scalars are replaced by the user value
-- a key suffixed with ``:REPLACE`` (e.g. ``settings:REPLACE:``) replaces the
-  generated value wholesale instead of merging into it
+- only where the same scalar key exists on both sides does the user value win
 """
 from __future__ import annotations
 
@@ -20,20 +19,15 @@ import yaml
 
 USER_SPEC_NAMES = ("xcode.yaml", "xcode.yml")
 
-REPLACE_SUFFIX = ":REPLACE"
-
 
 class UserSpecError(Exception):
     pass
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """XcodeGen-style merge of ``override`` on top of ``base``."""
+    """Merge ``override`` on top of ``base``."""
     merged = dict(base)
     for key, value in override.items():
-        if key.endswith(REPLACE_SUFFIX):
-            merged[key[: -len(REPLACE_SUFFIX)]] = value
-            continue
         current = merged.get(key)
         if isinstance(current, dict) and isinstance(value, dict):
             merged[key] = deep_merge(current, value)
