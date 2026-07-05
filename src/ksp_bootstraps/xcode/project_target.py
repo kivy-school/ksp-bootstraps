@@ -43,13 +43,13 @@ _INSTALL_PY_IOS = r"""mkdir -p "$CODESIGNING_FOLDER_PATH/python/lib"
 if [ "$EFFECTIVE_PLATFORM_NAME" = "-iphonesimulator" ]; then
     echo "Installing Python modules for iOS Simulator"
     SIM_ARCH=$(uname -m)
-    rsync -au --delete "$PROJECT_DIR/Frameworks/Python.xcframework/lib/python3.13/" "$CODESIGNING_FOLDER_PATH/python/lib/"
-    rsync -au --delete "$PROJECT_DIR/Frameworks/Python.xcframework/ios-arm64_x86_64-simulator/lib-${SIM_ARCH}/python3.13/lib-dynload" "$CODESIGNING_FOLDER_PATH/python/lib/"
+    rsync -au --delete "$PROJECT_DIR/Frameworks/Python.xcframework/lib/python__PY_MM__/" "$CODESIGNING_FOLDER_PATH/python/lib/"
+    rsync -au --delete "$PROJECT_DIR/Frameworks/Python.xcframework/ios-arm64_x86_64-simulator/lib-${SIM_ARCH}/python__PY_MM__/lib-dynload" "$CODESIGNING_FOLDER_PATH/python/lib/"
     rsync -au --delete "$PROJECT_DIR/site_packages/iphonesimulator/" "$CODESIGNING_FOLDER_PATH/python/site_packages"
 else
     echo "Installing Python modules for iOS Device"
-    rsync -au --delete "$PROJECT_DIR/Frameworks/Python.xcframework/lib/python3.13/" "$CODESIGNING_FOLDER_PATH/python/lib"
-    rsync -au --delete "$PROJECT_DIR/Frameworks/Python.xcframework/ios-arm64/lib-arm64/python3.13/lib-dynload" "$CODESIGNING_FOLDER_PATH/python/lib/"
+    rsync -au --delete "$PROJECT_DIR/Frameworks/Python.xcframework/lib/python__PY_MM__/" "$CODESIGNING_FOLDER_PATH/python/lib"
+    rsync -au --delete "$PROJECT_DIR/Frameworks/Python.xcframework/ios-arm64/lib-arm64/python__PY_MM__/lib-dynload" "$CODESIGNING_FOLDER_PATH/python/lib/"
     rsync -au --delete "$PROJECT_DIR/site_packages/iphoneos/" "$CODESIGNING_FOLDER_PATH/python/site_packages"
 fi
 rm -rf "$CODESIGNING_FOLDER_PATH/python/site_packages/bin"
@@ -60,7 +60,7 @@ rm "$CODESIGNING_FOLDER_PATH/python/site_packages/.lock"
 
 
 _INSTALL_PY_MACOS = r"""mkdir -p "$BUILT_PRODUCTS_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/python/lib"
-rsync -au --delete "$PROJECT_DIR/Frameworks/Python.xcframework/macos-arm64_x86_64/Python.framework/Versions/3.13/lib/python3.13/" "$BUILT_PRODUCTS_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/python/lib/"
+rsync -au --delete "$PROJECT_DIR/Frameworks/Python.xcframework/macos-arm64_x86_64/Python.framework/Versions/__PY_MM__/lib/python__PY_MM__/" "$BUILT_PRODUCTS_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/python/lib/"
 
 if [ -d "$PROJECT_DIR/site_packages/macos-arm64" ]; then
     mkdir -p "$BUILT_PRODUCTS_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/python/site_packages/arm64"
@@ -107,23 +107,30 @@ fi
 """
 
 
-def install_py_modules_script(uv_python: str | None = None) -> str:
+def install_py_modules_script(
+    uv_python: str | None = None, py_version: str | None = None
+) -> str:
     """Render the install/optimize build phase.
 
     ``uv_python`` is the version pin for the release byte-compile step
-    (exact patch from the project's .python-version when available);
-    defaults to the bundled runtime's major.minor.
+    (exact patch from the project's .python-version when available).
+    ``py_version`` is the bundled runtime's major.minor (e.g. "3.14"),
+    used for the python3.X paths inside the Python.xcframework.
+    Both default to the module-level 3.{PY_SUB_VERSION}.
     """
+    py_mm = py_version or f"3.{PY_SUB_VERSION}"
+    ios = _INSTALL_PY_IOS.replace("__PY_MM__", py_mm)
+    macos = _INSTALL_PY_MACOS.replace("__PY_MM__", py_mm)
     optimize = _RELEASE_OPTIMIZE_SITE.replace(
-        "__PY_VERSION__", uv_python or f"3.{PY_SUB_VERSION}"
+        "__PY_VERSION__", uv_python or py_mm
     )
     return f"""set -e
 if [ "$EFFECTIVE_PLATFORM_NAME" = "-iphonesimulator" ] || [ "$EFFECTIVE_PLATFORM_NAME" = "-iphoneos" ]; then
     echo "Installing Python modules for iOS Device/Simulator"
-    {_indent(_INSTALL_PY_IOS, "    ")}
+    {_indent(ios, "    ")}
 else
     echo "Installing Python modules for macOS"
-    {_indent(_INSTALL_PY_MACOS, "    ")}
+    {_indent(macos, "    ")}
 fi
 
 PYTHON="$PROJECT_DIR/python3"
@@ -237,7 +244,8 @@ class ProjectTarget:
         site_xcframeworks: list[str] | None = None,
         developer_team: str | None = None,
         post_build: Path | None = None,
-        uv_python: str | None = None
+        uv_python: str | None = None,
+        py_version: str | None = None
     ) -> None:
         self.name = name
         self.info_plist_extra = info_plist_extra
@@ -246,6 +254,7 @@ class ProjectTarget:
         self.developer_team = developer_team
         self.post_build = post_build
         self.uv_python = uv_python
+        self.py_version = py_version
 
     # ----- settings -----
 
@@ -350,7 +359,7 @@ class ProjectTarget:
             {"script": INSTALL_APP_MODULE_SCRIPT, "name": "Install App Module"},
             {"script": post_text, "name": "ksproject post-build"},
             {
-                "script": install_py_modules_script(self.uv_python),
+                "script": install_py_modules_script(self.uv_python, self.py_version),
                 "name": "Install target specific Python modules",
             },
             {"script": SIGN_PYTHON_BINARY_SCRIPT, "name": "Sign Python Binary Modules"},
