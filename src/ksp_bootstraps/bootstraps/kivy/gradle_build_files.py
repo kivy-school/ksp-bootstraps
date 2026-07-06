@@ -232,11 +232,21 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
 
+    sourceSets {
+        getByName("main") {
+            assets.srcDir(layout.buildDirectory.dir("generated/python_assets").get().asFile)
+        }
+    }
+
+    // CPython stdlib and packages contain underscore-prefixed directories
+    // (e.g. zipfile/_path) that AGP's default aapt ignore pattern strips.
+    // Override to keep them.
     androidResources {
         ignoreAssetsPatterns.clear()
         ignoreAssetsPatterns.addAll(listOf(
             "!.svn", "!.git", "!.ds_store", "!*.scc",
-            "!CVS", "!thumbs.db", "!picasa.ini", "!*~"
+            "!CVS", "!thumbs.db", "!picasa.ini", "!*~",
+            "python*", "lib-dynload", "site-packages"
         ))
     }
 }
@@ -395,6 +405,7 @@ abstract class OptimizePythonTask : DefaultTask() {{
 val sitePackagesAbis = listOf({arch_list_kts})
 val stagingDir = layout.buildDirectory.dir("python_assets_staging").get().asFile
 val assetsDir = layout.projectDirectory.dir("src/main/assets")
+val generatedAssetsDir = layout.buildDirectory.dir("generated/python_assets").get().asFile
 
 val stagePythonTasks = sitePackagesAbis.map {{ abi ->
     tasks.register<Copy>("stagePython_${{abi}}") {{
@@ -418,16 +429,6 @@ val stagePythonTasks = sitePackagesAbis.map {{ abi ->
     }}
 }}
 
-val cleanLegacyPython = tasks.register<Delete>("cleanLegacyPython") {{
-    group = "python"
-    dependsOn(stagePythonTasks)
-    delete(
-        assetsDir.dir("python{python_version}"),
-        assetsDir.dir("lib-dynload"),
-        assetsDir.dir("site-packages")
-    )
-}}
-
 val optimizeStagedTasks = sitePackagesAbis.map {{ abi ->
     tasks.register<OptimizePythonTask>("optimizeStaged_${{abi}}") {{
         group = "python"
@@ -448,10 +449,9 @@ val optimizeStagedTasks = sitePackagesAbis.map {{ abi ->
 val zipPythonAssets = tasks.register<Zip>("zipPythonAssets") {{
     group = "python"
     dependsOn(optimizeStagedTasks)
-    dependsOn(cleanLegacyPython) 
 
     archiveFileName.set("assets.zip")
-    destinationDirectory.set(assetsDir)
+    destinationDirectory.set(generatedAssetsDir)
 
     from(stagingDir) {{
         include("**/*")
@@ -501,7 +501,7 @@ tasks.named("preBuild") {{
 }}
 
 tasks.configureEach {{
-    if (name.contains("Assets") && name != "zipPythonAssets" && name != "cleanLegacyPython") {{
+    if (name.contains("Assets") && name != "zipPythonAssets") {{
         dependsOn(zipPythonAssets)
     }}
     if (name.startsWith("buildCMake") || name.startsWith("configureCMake") || name.startsWith("generateJsonModel")) {{
