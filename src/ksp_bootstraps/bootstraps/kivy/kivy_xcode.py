@@ -69,17 +69,21 @@ class KivyXcodeBuilder:
         self.info_plist_extra = info_plist_extra
         self.entitlements: dict = {}
         self.developer_team: str | None = None
+        self.ios_minimum_deployment: str | None = None
+        self.macos_minimum_deployment: str | None = None
         if ios is not None:
             info_plist_extra.update(ios.info_plist)
             self.entitlements.update(ios.entitlements)
             if ios.developer_team:
                 self.developer_team = ios.developer_team
+            self.ios_minimum_deployment = getattr(ios, "minimum_deployment", None)
         if macos is not None:
             # macOS keys win when both are present (entitlements typically diverge).
             info_plist_extra.update(macos.info_plist)
             self.entitlements.update(macos.entitlements)
             if macos.developer_team:
                 self.developer_team = macos.developer_team
+            self.macos_minimum_deployment = getattr(macos, "minimum_deployment", None)
 
         info_plist_extra["AppModule"] = self.module_name
 
@@ -187,6 +191,8 @@ class KivyXcodeBuilder:
             name=self.app_name,
             bundle_id_prefix=self.bundle_id_prefix,
             target=target,
+            ios_deployment_target=self.ios_minimum_deployment,
+            macos_deployment_target=self.macos_minimum_deployment,
         )
         return merge_user_spec(spec.to_dict(), self.working_dir)
 

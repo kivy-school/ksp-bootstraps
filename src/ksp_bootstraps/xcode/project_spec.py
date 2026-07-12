@@ -18,10 +18,14 @@ class ProjectSpec:
         name: str,
         bundle_id_prefix: str,
         target: ProjectTarget,
+        ios_deployment_target: str | None = None,
+        macos_deployment_target: str | None = None,
     ) -> None:
         self.name = name
         self.bundle_id_prefix = bundle_id_prefix
         self.target = target
+        self.ios_deployment_target = ios_deployment_target
+        self.macos_deployment_target = macos_deployment_target
 
     def _configs(self) -> dict[str, str]:
         return {"Debug": "debug", "Release": "release"}
@@ -65,11 +69,14 @@ class ProjectSpec:
             # Project-wide minimum deployment targets. XcodeGen emits the
             # correct per-platform *_DEPLOYMENT_TARGET build settings from this.
             # Needed because settingPresets is "none", so XcodeGen's bundled
-            # PLATFORM_* presets aren't applied. Values sourced from the Python
-            # preset mirror to keep a single source of truth.
+            # PLATFORM_* presets aren't applied. User overrides come from
+            # `minimum_deployment` in [tool.kivy-school.ios]/[tool.kivy-school.macos];
+            # the Python preset mirror provides the fallback.
             "deploymentTarget": {
-                "iOS": sp.PLATFORM_IOS["IPHONEOS_DEPLOYMENT_TARGET"],
-                "macOS": sp.PLATFORM_MACOS["MACOSX_DEPLOYMENT_TARGET"],
+                "iOS": self.ios_deployment_target
+                or sp.PLATFORM_IOS["IPHONEOS_DEPLOYMENT_TARGET"],
+                "macOS": self.macos_deployment_target
+                or sp.PLATFORM_MACOS["MACOSX_DEPLOYMENT_TARGET"],
             },
         }
 

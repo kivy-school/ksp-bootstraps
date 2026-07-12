@@ -28,14 +28,17 @@ class IosProtocol(Protocol):
 
     @property
     def frameworks(self) -> Sequence[str]: ...
-    
+
     @property
     def site_frameworks(self) -> Sequence[str]: ...
-    
-    
+
+    @property
+    def minimum_deployment(self) -> str | None: ...
+
+
 
 class MacOSProtocol(Protocol):
-    
+
     @property
     def bundle_id(self) -> str: ...
     
@@ -56,6 +59,9 @@ class MacOSProtocol(Protocol):
 
     @property
     def post_build(self) -> Path | None: ...
+
+    @property
+    def minimum_deployment(self) -> str | None: ...
 
 
 class AppleProtocol(Protocol):
