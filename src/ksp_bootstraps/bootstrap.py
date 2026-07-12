@@ -1,4 +1,4 @@
-from typing import Generic, Protocol
+from typing import Generic, Protocol, runtime_checkable
 from pathlib import Path
 
 from .platforms import Platform
@@ -7,38 +7,68 @@ from .platforms import Platform
 
 
 class ProjectDelegate(Protocol):
-    
-    def install_cpython(self, platform: Platform): ...
-
-    def android_prefix(self, ks_root: Path, arch: str, android_version: str) -> Path: ...
-
-    @property
-    def android_default_api_version(self) -> int: ...
-
-    @property
-    def android_sdk_path(self) -> str: ...
-    
-    @property
-    def android_ndk_version(self) -> str: ...
-    
-    @property
-    def android_ndk_path(self) -> str: ...
-    
-    @property
-    def android_java_path(self) -> str: ...
-    
-    @property
-    def android_py_version(self) -> str: ...
-
-    
 
     @property
     def py_version(self) -> str: ...
 
+    @property
+    def working_dir(self) -> Path: ...
+    
+    def install_cpython(self): ...
 
+@runtime_checkable
+class GradleProjectDelegate(Protocol):
+
+    @property
+    def py_version(self) -> str: ...
 
     @property
     def working_dir(self) -> Path: ...
+    
+    def install_cpython(self): ...
+
+    def android_prefix(self, ks_root: Path, arch: str, android_version: str) -> Path: ...
+
+    @property
+    def default_api_version(self) -> int: ...
+
+    @property
+    def sdk_path(self) -> str: ...
+    
+    @property
+    def ndk_version(self) -> str: ...
+    
+    @property
+    def ndk_path(self) -> str: ...
+    
+    @property
+    def java_path(self) -> str: ...
+
+    @property
+    def android_py_version(self) -> str: ...
+
+    @property
+    def uv_py_version(self) -> str: ...
+
+@runtime_checkable
+class XcodeProjectDelegate(Protocol):
+
+    @property
+    def py_version(self) -> str: ...
+
+    @property
+    def uv_py_version(self) -> str: ...
+
+    @property
+    def working_dir(self) -> Path: ...
+
+    def install_cpython(self): ...
+
+    def xcode_generate(self, **kw): ...
+
+    
+
+    
     
     
 
@@ -51,5 +81,9 @@ class BootstrapProtocol(Protocol):
     def delegate(self) -> ProjectDelegate:
         ...
 
-    def generate(self, **kw: object): ...
+    def generate(self, **kw: object) -> Path | None: ...
+
+    def sync_site_xcframeworks(self) -> None: ...
+
+    def install_frameworks(self) -> None: ...
 

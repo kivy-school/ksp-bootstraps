@@ -57,3 +57,11 @@ class MacOSProtocol(Protocol):
     @property
     def post_build(self) -> Path | None: ...
 
+
+class AppleProtocol(Protocol):
+
+    @property
+    def ios(self) -> IosProtocol | None: ...
+
+    @property
+    def macos(self) -> MacOSProtocol | None: ...
