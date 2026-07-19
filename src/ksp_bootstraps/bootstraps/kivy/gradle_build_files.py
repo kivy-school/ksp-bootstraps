@@ -656,22 +656,11 @@ public class MainActivity extends PythonActivity {{
     private void syncWindowLayout() {{
         if (mActivity != null && mActivity.getWindow() != null) {{
             android.view.Window window = mActivity.getWindow();
-            
+
             if (Build.VERSION.SDK_INT >= 35) {{
                 window.setDecorFitsSystemWindows(false);
-                window.addFlags(android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
-                window.setStatusBarColor(android.graphics.Color.TRANSPARENT);
-                window.setNavigationBarColor(android.graphics.Color.TRANSPARENT);
                 window.setNavigationBarContrastEnforced(false);
                 window.setStatusBarContrastEnforced(false);
-                
-                android.view.WindowManager.LayoutParams layoutParams = window.getAttributes();
-                layoutParams.layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
-                window.setAttributes(layoutParams);
-            }} else {{
-                if (window.getDecorView() != null) {{
-                    window.getDecorView().setSystemUiVisibility(android.view.View.SYSTEM_UI_FLAG_VISIBLE);
-                }}
             }}
         }}
     }}
@@ -716,8 +705,37 @@ public class MainActivity extends PythonActivity {{
 
         {show_presplash_code}
 
+        long currentUpdate = 0;
+        try {{
+            android.content.pm.PackageInfo pInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
+            currentUpdate = pInfo.lastUpdateTime;
+        }} catch (Exception e) {{
+            Log.e(TAG, "Failed to get package info", e);
+        }}
+
         final File unpackDoneFile = new File(appDir, ".unpack_done");
-        if (!unpackDoneFile.exists()) {{
+        final File versionFile = new File(appDir, ".version");
+        boolean needsUnpack = true;
+
+        if (versionFile.exists() && unpackDoneFile.exists()) {{
+            try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(versionFile))) {{
+                String stored = br.readLine();
+                if (stored != null && stored.equals(String.valueOf(currentUpdate))) {{
+                    needsUnpack = false;
+                }}
+            }} catch (IOException e) {{
+                Log.e(TAG, "Failed to read version file", e);
+            }}
+        }}
+
+        // 3. Unpack if missing or updated
+        if (needsUnpack) {{
+            // Delete unpack flag synchronously so main.c blocks immediately
+            if (unpackDoneFile.exists()) {{
+                unpackDoneFile.delete();
+            }}
+
+            final long finalUpdate = currentUpdate;
             new Thread(new Runnable() {{
                 @Override
                 public void run() {{
@@ -727,9 +745,14 @@ public class MainActivity extends PythonActivity {{
                         if (abi == null) {{
                             Log.e(TAG, "Could not find any matching ABI in assets.zip");
                         }}
-                        
+
                         extractZipAsset(getAssets(), "assets.zip", appDir, abi);
-                        
+
+                        // Write the new version timestamp
+                        try (java.io.FileWriter fw = new java.io.FileWriter(versionFile)) {{
+                            fw.write(String.valueOf(finalUpdate));
+                        }}
+
                         // Signal to main.c that extraction is complete
                         unpackDoneFile.createNewFile();
                     }} catch (IOException e) {{
