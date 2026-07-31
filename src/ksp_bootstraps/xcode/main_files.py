@@ -6,7 +6,7 @@ Bakes in the KivyLauncher backend behavior from
 from __future__ import annotations
 import textwrap
 
-def render_main_swift(platform: str) -> str:
+def render_main_swift(platform: str, run_func: str = "SDLmain") -> str:
     """Return the contents of ``main.swift`` for the given Apple platform.
 
     ``platform`` is ``"iOS"`` or ``"macOS"``.
@@ -33,35 +33,51 @@ def render_main_swift(platform: str) -> str:
     return textwrap.dedent(f"""\
     import Foundation
 
-    exit(KivyLauncher.SDLmain())
+    exit(KivyLauncher.{run_func}())
     """)
 
-def __render_main_swift(platform: str) -> str:
+def __render_main_swift(
+        platform: str, 
+        run_func: str = "SDLmain", 
+        imports: list[str] = [],
+        modules: list[str] = []
+    ) -> str:
     """Return the contents of ``main.swift`` for the given Apple platform.
 
     ``platform`` is ``"iOS"`` or ``"macOS"``.
     """
     if platform == "iOS":
-        imports = "import KivyLauncher\nimport Kivy_iOS_Module"
-        modules = ".ios"
+        #_imports = "import KivyLauncher\nimport Kivy_iOS_Module"
+        #_modules = ".ios"
+        _imports = "\n\t".join(imports)
+        _modules = "\n\t".join(imports)
     elif platform == "macOS":
-        imports = "import KivyLauncher"
-        modules = ""
+        _imports = "\n\t".join(imports)
+        _modules = "\n\t".join(imports)
     else:
         raise ValueError(f"Unsupported platform for main.swift: {platform!r}")
 
     return f"""import Foundation
-import PySwiftKit
-{imports}
+import Foundation
+import PyNucleantUI
 
-// post_imports
-KivyLauncher.pyswiftImports = [
-    {modules}
-]
 
-// main
-let exit_status = KivyLauncher.SDLmain()
+func onPreLaunch() {{
 
-// on_exit
-exit(exit_status)
+}}
+
+func onPreImport() {{
+    PyNucleantUI_Package.addToImports()
+    
+}}
+
+func onQuit(status: Int32) {{
+    exit(status)
+}}
+
+NucleantLauncher.runApp(
+    on_prelaunch: onPreLaunch,
+    on_preimport: onPreImport,
+    on_quit: onQuit
+)
 """
