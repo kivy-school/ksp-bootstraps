@@ -1,15 +1,18 @@
-from ksp_bootstraps.bootstrap import BootstrapProtocol, ProjectDelegate, XcodeProjectDelegate, GradleProjectDelegate
-from .kivy_gradle import KivyGradleBuilder
-from .kivy_xcode import KivyXcodeBuilder
-from ...platforms import Platform
-from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
-from ...pyproject_models.kivy_school.apple import MacOSProtocol, IosProtocol
-from ...pyproject_models.kivy_school.gradle import AndroidProtocol
 from pathlib import Path
 
+from ...bootstrap import ProjectDelegate, XcodeProjectDelegate, GradleProjectDelegate
+from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
+from .nucleant_gradle import NucleantGradleBuilder
+from .nucleant_xcode import NucleantXcodeBuilder
 
 
-class KivyBootstrap:
+class NucleantBootstrap:
+    """Nucleant's project bootstrap: a Vulkan surface hosted by the platform's
+    own view class, with Swift between it and Python.
+
+    On Apple that is a UIView/NSView backed by CAMetalLayer; on Android a plain
+    Activity's SurfaceView. Neither goes through SDL.
+    """
 
     delegate: ProjectDelegate
     py_project: PyProjectTomlProtocol
@@ -25,19 +28,17 @@ class KivyBootstrap:
             match platform:
                 case "android":
                     if isinstance(delegate, GradleProjectDelegate):
-                        KivyGradleBuilder(self.py_project, delegate).generate(**kw)
+                        NucleantGradleBuilder(self.py_project, delegate).generate(**kw)
                 case "apple":
                     if isinstance(delegate, XcodeProjectDelegate):
-                        return KivyXcodeBuilder(self.py_project, delegate).generate(**kw)
+                        return NucleantXcodeBuilder(self.py_project, delegate).generate(**kw)
                 case _:
                     raise NotImplementedError(platform)
-                
+
     def sync_site_xcframeworks(self) -> None:
         if isinstance(self.delegate, XcodeProjectDelegate):
-            KivyXcodeBuilder(self.py_project, self.delegate).sync_site_xcframeworks()
+            NucleantXcodeBuilder(self.py_project, self.delegate).sync_site_xcframeworks()
 
     def install_frameworks(self) -> None:
         if isinstance(self.delegate, XcodeProjectDelegate):
-            KivyXcodeBuilder(self.py_project, self.delegate)._install_frameworks()
-
-    
+            NucleantXcodeBuilder(self.py_project, self.delegate)._install_frameworks()

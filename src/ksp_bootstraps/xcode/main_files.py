@@ -37,30 +37,34 @@ def render_main_swift(platform: str, run_func: str = "SDLmain") -> str:
     """)
 
 def __render_main_swift(
-        platform: str, 
-        run_func: str = "SDLmain", 
-        imports: list[str] = [],
-        modules: list[str] = []
+        platform: str,
+        run_func: str = "runApp",
+        imports: list[str] | None = None,
+        modules: list[str] | None = None,
     ) -> str:
-    """Return the contents of ``main.swift`` for the given Apple platform.
+    """Return the contents of ``main.swift`` for a Nucleant app.
 
-    ``platform`` is ``"iOS"`` or ``"macOS"``.
+    ``platform`` is ``"iOS"`` or ``"macOS"``.  Both get the same body:
+    ``NucleantLauncher`` declares ``runApp`` on either platform (differing only
+    in whether it hands the process to ``UIApplicationMain``), so the entry
+    point is one call regardless.
+
+    ``imports`` adds modules beyond the two always needed; ``modules`` adds
+    extra ``addToImports()`` registrations inside ``onPreImport``, which is the
+    hook that runs after the interpreter is configured but before the app
+    module is imported.
     """
-    if platform == "iOS":
-        #_imports = "import KivyLauncher\nimport Kivy_iOS_Module"
-        #_modules = ".ios"
-        _imports = "\n\t".join(imports)
-        _modules = "\n\t".join(imports)
-    elif platform == "macOS":
-        _imports = "\n\t".join(imports)
-        _modules = "\n\t".join(imports)
-    else:
+    if platform not in ("iOS", "macOS"):
         raise ValueError(f"Unsupported platform for main.swift: {platform!r}")
 
-    return f"""import Foundation
-import Foundation
-import PyNucleantUI
+    extra_imports = "".join(f"import {name}\n" for name in (imports or []))
+    extra_modules = "".join(
+        f"    {name}.addToImports()\n" for name in (modules or [])
+    )
 
+    return f"""import Foundation
+import PyNucleantUI
+{extra_imports}
 
 func onPreLaunch() {{
 
@@ -68,14 +72,13 @@ func onPreLaunch() {{
 
 func onPreImport() {{
     PyNucleantUI_Package.addToImports()
-    
-}}
+{extra_modules}}}
 
 func onQuit(status: Int32) {{
     exit(status)
 }}
 
-NucleantLauncher.runApp(
+NucleantLauncher.{run_func}(
     on_prelaunch: onPreLaunch,
     on_preimport: onPreImport,
     on_quit: onQuit

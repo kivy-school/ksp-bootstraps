@@ -1,6 +1,7 @@
 
 
 from .kivy import KivyBootstrap
+from .nucleant import NucleantBootstrap
 from ..bootstrap import BootstrapProtocol, ProjectDelegate
 from ..pyproject_models.pyproject_toml import PyProjectTomlProtocol
 
@@ -20,6 +21,8 @@ def get_bootstrap(name: str, pyproject: PyProjectTomlProtocol, delegate: Project
     match name:
         case "kivy":
             return KivyBootstrap(pyproject, delegate)
+        case "nucleant":
+            return NucleantBootstrap(pyproject, delegate)
         case _ if name in registered_bootstraps:
             return registered_bootstraps[name]
         case _:

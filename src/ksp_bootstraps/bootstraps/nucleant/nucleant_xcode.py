@@ -13,7 +13,12 @@ from ksp_bootstraps.platforms import ApplePlatform
 # from ..pyproject_toml import PyProjectToml
 from ksp_bootstraps.pyproject_models.pyproject_toml import PyProjectTomlProtocol
 from ksp_bootstraps.xcode.xcodegen_runner import XcodeGenProtocol
-from ksp_bootstraps.xcode.main_files import __render_main_swift
+# Aliased on import, and it has to be: a `__`-prefixed name written inside a
+# class body is mangled to `_ClassName__name`, so calling it as
+# `__render_main_swift(...)` from a method raises NameError.
+from ksp_bootstraps.xcode.main_files import (
+    __render_main_swift as render_nucleant_main_swift,
+)
 from ksp_bootstraps.xcode.plist_templates import STDLIB_PLIST_XML
 from ksp_bootstraps.xcode.project_spec import ProjectSpec
 from ksp_bootstraps.xcode.project_target import ProjectTarget
@@ -33,7 +38,7 @@ class XcodeProjectBuilderError(Exception):
     pass
 
 
-class KivyXcodeBuilder:
+class NucleantXcodeBuilder:
     """Materializes ``project_dist/xcode/`` and runs ``xcodegen``."""
 
     delegate: XcodeProjectDelegate
@@ -141,10 +146,10 @@ class KivyXcodeBuilder:
     def _write_sources(self) -> None:
         ios_main = self.project_dir / "Sources/IphoneOS/main.swift"
         if not ios_main.exists():
-            ios_main.write_text(__render_main_swift("iOS", "runApp"))
+            ios_main.write_text(render_nucleant_main_swift("iOS", "runApp"))
         macos_main = self.project_dir / "Sources/MacOS/main.swift"
         if not macos_main.exists():
-            macos_main.write_text(__render_main_swift("macOS", "runApp"))
+            macos_main.write_text(render_nucleant_main_swift("macOS", "runApp"))
         NucleantLauncher_src = Path(__file__).parent / "templates" / "NucleantLauncher.swift"
         shared_kl = self.project_dir / "Sources/Shared/NucleantLauncher.swift"
         if not shared_kl.exists():

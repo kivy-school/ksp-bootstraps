@@ -1,8 +1,16 @@
 //
-//  PyLauncher.swift
+//  NucleantLauncher.swift
+//
+//  Boots CPython inside the app bundle and runs the app module. The Apple
+//  counterpart of the Android bootstrap's main.swift — same three jobs
+//  (configure the interpreter, point it at the bundled stdlib/site-packages,
+//  run `python -m <AppModule>`), with the platform's own app lifecycle around
+//  it instead of an Activity.
+//
+//  No SDL anywhere: Nucleant renders into a CAMetalLayer-backed view that
+//  NucleantApplication owns (VulkanView on both iOS and macOS, via MoltenVK).
 //
 import Python
-import PathKit
 
 import OSLog
 
@@ -10,15 +18,6 @@ import OSLog
 import UIKit
 import NucleantApplication
 #endif
-
-//typealias PyPointer = UnsafeMutablePointer<PyObject>
-
-typealias SDL_main_func = @convention(c) (_ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32
-typealias SDL_UIKitRunApp = @convention(c) (
-    _ argc: Int32,
-    _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>,
-    _ mainFunction: SDL_main_func
-) -> Int32
 
 func run_module_as_main(_ name: String) -> Int32 {
     
@@ -55,46 +54,28 @@ nonisolated final class NucleantLauncher {
     
     
     var env: Environment = .init()
-    
-    let IOS_IS_WINDOWED: Bool = false
-    var KIVY_CONSOLELOG: Bool = true
-    
+
     init() throws {
-        
+
     }
-    
+
     func setup() {
-        pythonSettings()
-        kivySettings()
+        platformSettings()
         #if os(iOS)
         export_orientation()
         #endif
     }
-    
-    private func pythonSettings() {
-        
-    }
-    
-    private func kivySettings() {
-        // Kivy environment to prefer some implementation on iOS platform
+
+    private func platformSettings() {
         #if os(iOS)
-        env.KIVY_BUILD = "ios"
-        env.KIVY_WINDOW = "sdl2"
-        env.KIVY_IMAGE = "imageio,tex,gif,sdl2"
-        env.KIVY_AUDIO = "sdl2"
-        env.KIVY_GL_BACKEND = "sdl2"
-        
-        // IOS_IS_WINDOWED=True disables fullscreen and then statusbar is shown
-        env.IOS_IS_WINDOWED = IOS_IS_WINDOWED
+        env.NUCLEANT_PLATFORM = "ios"
+        #elseif os(macOS)
+        env.NUCLEANT_PLATFORM = "macos"
         #endif
-        
-        if !KIVY_CONSOLELOG {
-            env.KIVY_NO_CONSOLELOG = "1"
-        }
     }
-    
+
     func preLaunch(_ on_pre_launch: @escaping ()->Void) throws {
-        kivySettings()
+        platformSettings()
         #if os(iOS)
         export_orientation()
         #endif
@@ -117,35 +98,32 @@ nonisolated final class NucleantLauncher {
     private func export_orientation() {
         let info = Bundle.main.infoDictionary
         let orientations = info?["UISupportedInterfaceOrientations"] as? [AnyHashable]
-        //var result = "KIVY_ORIENTATION="
         var result = ""
         for i in 0..<(orientations?.count ?? 0) {
             var item = orientations?[i] as? String
+            // Trim the "UIInterfaceOrientation" prefix, leaving e.g. "Portrait".
             item = (item as NSString?)?.substring(from: 22)
             if i > 0 {
                 result = result + " "
             }
             result = result + (item ?? "")
         }
-        
+
         #if os(iOS)
-        env.KIVY_ORIENTATION = result
+        env.NUCLEANT_ORIENTATION = result
         #endif
-        
+
         #if DEBUG
         print("Available orientation: \(result)")
         #endif
     }
-    
+
     #if os(iOS)
-    // SDL2 isn't bundled in this app anymore (no SDL2.framework in the app's
-    // Frameworks), so the old dlopen/dlsym("SDL_UIKitRunApp") path can never
-    // resolve. SDL_UIKitRunApp was only ever a thin wrapper around
-    // UIApplicationMain, so we call that directly instead. UIApplicationMain
-    // does not return during normal operation -- that's what keeps the
-    // process alive; running KivyLauncher.run() synchronously and returning
-    // (the previous behavior) let main.swift fall off the end and exit(0)
-    // right after Python's on_launch finished.
+    // UIApplicationMain is called directly rather than returning after Python
+    // finishes: it does not return during normal operation, and that is what
+    // keeps the process alive. Running the launcher synchronously and returning
+    // would let main.swift fall off the end and exit(0) the moment on_launch
+    // completed.
     //
     // The Python bootstrap (and therefore the first WindowBase.present())
     // must not run until a UIWindowScene has connected: WindowBase builds its
@@ -153,7 +131,7 @@ nonisolated final class NucleantLauncher {
     // resizing instead of a fixed size), and no scene exists yet during
     // application(_:didFinishLaunchingWithOptions:) -- scene(_:willConnectTo:)
     // always fires after it. So this app only implements the application
-    // delegate to hand out a scene configuration; KivySceneDelegate is what
+    // delegate to hand out a scene configuration; NucleantSceneDelegate is what
     // actually kicks off Python, once ActiveScene.current is set.
     final class LaunchDelegate: UIResponder, UIApplicationDelegate {
         func application(
@@ -165,7 +143,7 @@ nonisolated final class NucleantLauncher {
                 name: "Default Configuration",
                 sessionRole: connectingSceneSession.role
             )
-            config.delegateClass = KivySceneDelegate.self
+            config.delegateClass = NucleantSceneDelegate.self
             return config
         }
     }
@@ -175,7 +153,7 @@ nonisolated final class NucleantLauncher {
         on_preimport: @escaping ()->Void,
         on_quit: @escaping (Int32)->Void
     ) {
-        KivySceneDelegate.onConnect = {
+        NucleantSceneDelegate.onConnect = {
             var argv: [UnsafeMutablePointer<CChar>?] = []
             NucleantLauncher.run(
                 0,
@@ -193,13 +171,21 @@ nonisolated final class NucleantLauncher {
         )
     }
     #else
-    static func SDLmain(
+    // macOS has no scene to wait for, and no UIApplicationMain to hand the
+    // process to: NucleantApplication.setup() installs the NSApplication
+    // delegate, and Python's App.run() is what calls NSApplication.run(). So
+    // the interpreter is started directly here, and on_quit fires when the app
+    // module returns.
+    //
+    // Same name as the iOS entry point on purpose — main.swift is generated
+    // from one template for both platforms and calls `runApp` either way.
+    static func runApp(
         on_prelaunch: @escaping ()->Void,
         on_preimport: @escaping ()->Void,
         on_quit: @escaping (Int32)->Void
     ) {
         var argv: [UnsafeMutablePointer<CChar>?] = []
-        KivyLauncher.run(
+        NucleantLauncher.run(
             0,
             &argv,
             on_prelaunch,
@@ -217,7 +203,7 @@ nonisolated final class NucleantLauncher {
 /// — never before). Records the scene in `ActiveScene.current` so the first
 /// `WindowBase.present()` (triggered by `onConnect`, below) has a real scene
 /// to build its window from, instead of a hardcoded/full-screen guess.
-final class KivySceneDelegate: UIResponder, UIWindowSceneDelegate {
+final class NucleantSceneDelegate: UIResponder, UIWindowSceneDelegate {
     nonisolated(unsafe) static var onConnect: (() -> Void)?
     private static var launched = false
 
