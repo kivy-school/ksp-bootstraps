@@ -1,7 +1,13 @@
-"""Writes Gradle project files (Kotlin DSL / .kts). Ported from GradleBuildFiles.swift.
+"""Writes Gradle project files (Kotlin DSL / .kts) for the Nucleant bootstrap.
 
-Swift-specific tasks (SwiftPM build / copy / Swift activity) are intentionally
-omitted — generated projects are pure AGP."""
+Unlike the Kivy bootstrap this generates no SDL2, no CMake, and no p4a
+compatibility layer.  A Nucleant app is a plain ``android.app.Activity`` hosting
+a ``SurfaceView``, and everything below the Java line is Swift: Gradle
+cross-compiles the SwiftPM package in ``app/swift/`` once per ABI (the pattern
+from swiftlang/swift-android-examples), copies the products and the Swift
+runtime into ``jniLibs/<abi>/``, and adds the Java that swift-java's jextract
+generated to the app's source set.
+"""
 
 from __future__ import annotations
 
@@ -11,12 +17,13 @@ import zlib
 from pathlib import Path
 from enum import StrEnum
 
-# from ksproject_utils.pyproject_toml import KivySchoolData
-# from ksproject_utils.gradle.android_toolchain import DEFAULT_API_VERSION
-from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
-from ...pyproject_models.pyproject_toml import KivySchoolProtocol, AndroidProtocol
-
-#Arch = AndroidProtocol.Arch
+from ...pyproject_models.pyproject_toml import AndroidProtocol
+from .swift_package_files import (
+    JAVA_PACKAGE,
+    PYTHON_INCLUDE_DIR,
+    SWIFT_PACKAGE_DIR,
+    SWIFT_TARGET_NAME,
+)
 
 _GRADLE_VERSION = "9.5.0"
 # Gradle commits the wrapper jar to their own repo; download it directly so
@@ -26,9 +33,91 @@ _GRADLE_WRAPPER_JAR_URL = (
     f"/refs/tags/v{_GRADLE_VERSION}/gradle/wrapper/gradle-wrapper.jar"
 )
 
+# Android ABI -> (Swift target triple stem, Swift SDK resource dir, NDK triple).
+# The Swift Android SDK lays its runtime out by its own arch names
+# (swift-aarch64) and the NDK by triple (aarch64-linux-android), neither of
+# which matches Gradle's ABI directory names — this table is the join.
+# 64-bit only, matching the two Android platforms ksp_bootstraps defines
+# (AndroidArm64Platform, AndroidX86_64Platform). There is no 32-bit entry
+# because nothing can request one.
+_SWIFT_ABIS: dict[str, tuple[str, str, str]] = {
+    "arm64-v8a": ("aarch64-unknown-linux-android", "swift-aarch64", "aarch64-linux-android"),
+    "x86_64": ("x86_64-unknown-linux-android", "swift-x86_64", "x86_64-linux-android"),
+}
+
+# Swift runtime shared libraries copied out of the SDK into jniLibs.  Android
+# has no system Swift runtime, so anything the app touches has to ship with it.
+_SWIFT_RUNTIME_LIBS = [
+    "swiftCore",
+    "swift_Concurrency",
+    "swift_StringProcessing",
+    "swift_RegexParser",
+    "swift_Builtin_float",
+    "swift_math",
+    "swiftAndroid",
+    "dispatch",
+    "BlocksRuntime",
+    "swiftSwiftOnoneSupport",
+    "swiftDispatch",
+    "Foundation",
+    "FoundationEssentials",
+    "FoundationInternationalization",
+    "_FoundationICU",
+    "swiftSynchronization",
+]
+
 
 class GradleBuildError(Exception):
     pass
+
+
+# Templates a project can edit are written once and then read back, so a change
+# to the defaults below does not reach a project that already has one. Each
+# carries a version marker; when the default's version is newer, the project's
+# copy is replaced and the old one kept beside it. Bump these whenever the
+# corresponding default template changes in a way an app needs.
+_TEMPLATE_VERSION_MARKER = "ksproject-template:"
+_BUILD_GRADLE_TEMPLATE_VERSION = 2
+_MANIFEST_TEMPLATE_VERSION = 2
+
+
+def _template_version(text: str) -> int:
+    """The version a template declares, or 0 if it predates the marker."""
+    for line in text.splitlines()[:5]:
+        if _TEMPLATE_VERSION_MARKER in line:
+            digits = line.split(_TEMPLATE_VERSION_MARKER, 1)[1]
+            digits = "".join(c for c in digits if c.isdigit())
+            if digits:
+                return int(digits)
+    return 0
+
+
+def _ensure_template(path: Path, default: str, version: int) -> str:
+    """Return the template to use, refreshing the project's copy if it is stale.
+
+    A stale copy is moved aside rather than deleted: it may carry hand edits, and
+    silently discarding those would be worse than the staleness this fixes.
+    """
+    if not path.exists():
+        print(f"{path.name} not found... Continuing with default template...")
+        path.write_text(default, encoding="utf-8")
+        return default
+
+    existing = path.read_text(encoding="utf-8")
+    found = _template_version(existing)
+    if found >= version:
+        return existing
+
+    backup = path.with_suffix(path.suffix + f".v{found}.bak")
+    backup.write_text(existing, encoding="utf-8")
+    path.write_text(default, encoding="utf-8")
+    print(
+        f"[ksproject] {path.name} was version {found}, the generator needs "
+        f"{version} — replaced it. Your copy is at {backup.name}; re-apply any "
+        "edits from it."
+    )
+    return default
+
 
 
 class GradleBuildFiles:
@@ -79,9 +168,17 @@ include(":app")
         content = (
             "# Project-wide Gradle settings - generated by ksproject\n"
             "org.gradle.jvmargs=-Xmx1g -Dfile.encoding=UTF-8\n"
-            "org.gradle.configuration-cache=true\n"
+            # The Swift build tasks shell out and read the environment at
+            # execution time, which the configuration cache rejects.
+            "org.gradle.configuration-cache=false\n"
             "android.useAndroidX=true\n"
             "android.nonTransitiveRClass=true\n"
+            "\n"
+            "# Swift toolchain used to cross-compile app/swift/ for Android.\n"
+            "# Override either here or via the matching environment variable.\n"
+            "# swift.path=/path/to/swift          (env: SWIFT_PATH)\n"
+            "# swift.sdk=swift-6.3-RELEASE_android  (env: SWIFT_ANDROID_SDK)\n"
+            "# swift.config=release               (env: SWIFT_BUILD_CONFIG)\n"
         )
         (dir / "gradle.properties").write_text(content, encoding="utf-8")
 
@@ -149,8 +246,9 @@ include(":app")
         uv_python: str | None = None,
     ) -> None:
 
-        abi_filters = ", ".join(f'"{a.value}"' for a in archs)
-        arch_list_kts = ", ".join(f'"{a.value}"' for a in archs)
+        arch_values = [a.value for a in archs]
+        abi_filters = ", ".join(f'"{a}"' for a in arch_values)
+        arch_list_kts = abi_filters
         ndk_line = f'    ndkVersion = "{ndk_version}"\n' if ndk_version else ""
         plugin_id = "com.android.library" if aar else "com.android.application"
 
@@ -167,21 +265,38 @@ include(":app")
         )
 
         ndk_path_str = str(ndk_path).replace("\\", "/") if ndk_path else ""
-        site_packages_tasks = GradleBuildFiles._site_packages_tasks(
+        # The Swift Android SDK's artifact bundles only carry triples from API
+        # 28 up; a lower minSdk is fine for the Java side but has no Swift
+        # runtime to build against.
+        # The bootstrap AAR declares minSdkVersion 28 (the Swift Android SDK's
+        # floor), and AGP enforces it, so a lower min_api fails the build with a
+        # message naming the AAR rather than crashing on a device.
+        if min_sdk < 28:
+            print(
+                f"[ksproject] min_api {min_sdk} is below the bootstrap AAR's "
+                "minSdkVersion 28; the Gradle build will reject it."
+            )
+        # No Swift is *compiled* here — the bootstrap ships prebuilt in the AAR —
+        # but the Swift runtime is still staged from the installed SDK, because
+        # the app's own Swift libraries (the nucleant wheel's .so) need it and
+        # the AAR deliberately does not carry a second copy.
+        swift_config = GradleBuildFiles._swift_runtime_config()
+        build_tasks = GradleBuildFiles._swift_runtime_tasks(arch_values)
+        build_tasks += GradleBuildFiles._site_packages_tasks(
             arch_list_kts, python_version, byte_compile_default, uv_python
         )
-        site_packages_tasks += GradleBuildFiles._post_build_task(post_build)
+        build_tasks += GradleBuildFiles._post_build_task(post_build)
 
         template_path = project_dir / "build.tmpl.gradle.kts"
 
-        if not template_path.exists():
-            print(
-                "build.tmpl.gradle.kts not found... Continuing with default template..."
-            )
-            default_template = """\
+        default_template = """\
+// ksproject-template: 2 — do not remove; the generator replaces this file when
+// its own default is newer, keeping your copy as build.tmpl.gradle.kts.vN.bak.
 plugins {
     id("{{ plugin_id }}")
 }
+
+{{ swift_config }}
 
 android {
     namespace = "{{ package_name }}"
@@ -195,29 +310,11 @@ android {
         ndk {
             abiFilters += setOf({{ abi_filters }})
         }
-
-        externalNativeBuild {
-            cmake {
-                arguments += listOf("-DANDROID_STL=c++_static")
-            }
-        }
     }
 
     packaging {
         jniLibs {
             useLegacyPackaging = true
-            // excludes += setOf(
-            //     "**/libcrypto.so",
-            //     "**/libssl.so",
-            //     "**/libsqlite3.so"
-            // )
-        }
-    }
-
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
         }
     }
 
@@ -228,13 +325,14 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     sourceSets {
         getByName("main") {
             assets.srcDir(layout.buildDirectory.dir("generated/python_assets").get().asFile)
+            jniLibs.srcDir(layout.buildDirectory.dir("generated/jniLibs").get().asFile)
         }
     }
 
@@ -252,15 +350,22 @@ android {
 }
 
 dependencies {
+    // libs/ carries the Nucleant bootstrap AAR: the JNI bridge, the CPython
+    // launcher, org.nucleantui.NucleantActivity, and the Swift runtime this
+    // app's Swift wheels need. Built separately — see the bootstrap library —
+    // and destined to become a Maven coordinate.
     implementation(fileTree("libs") { include("*.aar", "*.jar") })
+    // No swiftkit-core dependency: org.swift.swiftkit:swiftkit-core is not
+    // published to any repository, so the classes jextract's output needs are
+    // compiled into the bootstrap AAR itself.
 {{ extra_deps }}
 }
 
-{{ site_packages_tasks }}
+{{ build_tasks }}
 """
-            template_path.write_text(default_template, encoding="utf-8")
-
-        template_content = template_path.read_text(encoding="utf-8")
+        template_content = _ensure_template(
+            template_path, default_template, _BUILD_GRADLE_TEMPLATE_VERSION
+        )
 
         build_content = template_content.replace("{{ plugin_id }}", plugin_id)
         build_content = build_content.replace("{{ package_name }}", package_name)
@@ -272,18 +377,177 @@ dependencies {
         build_content = build_content.replace("{{ target_sdk }}", str(target_sdk))
         build_content = build_content.replace("{{ abi_filters }}", abi_filters)
         build_content = build_content.replace("{{ extra_deps }}", extra_deps)
-        build_content = build_content.replace(
-            "{{ site_packages_tasks }}", site_packages_tasks
-        )
+        build_content = build_content.replace("{{ swift_config }}", swift_config)
+        build_content = build_content.replace("{{ build_tasks }}", build_tasks)
 
         (app_dir / "build.gradle.kts").write_text(build_content, encoding="utf-8")
         (app_dir / "libs").mkdir(parents=True, exist_ok=True)
 
+    # -------------------------------------------------------------------------
+    # Swift build tasks
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _swift_runtime_config() -> str:
+        """Locates the installed Swift Android SDK.
+
+        The app compiles no Swift, but it packages Swift libraries — the
+        nucleant wheel's — and Android has no system Swift runtime, so the
+        runtime has to come from somewhere. It comes from here, the same place it
+        always did. The bootstrap AAR deliberately does not carry a second copy:
+        with one toolchain installed, two copies is just two copies.
+
+        Kotlin script top-level vals initialize in source order, so this has to
+        precede the tasks that use it.
+        """
+        return """\
+// ── Swift runtime ────────────────────────────────────────────────────────────
+// Staged out of the installed Swift Android SDK into jniLibs. Nothing here is
+// compiled; the bootstrap itself is a prebuilt AAR in libs/.
+
+data class SwiftAbi(val runtimeDir: String, val ndkTriple: String)
+
+val generatedJniLibsDir = layout.buildDirectory.dir("generated/jniLibs")
+
+/**
+ * Root holding the installed Android Swift SDK artifact bundles. Checked in the
+ * order SwiftPM itself checks, so an SDK installed with `swift sdk install` is
+ * found without configuration.
+ */
+fun swiftSdkRoot(): File {
+    val configured =
+        (project.findProperty("swift.sdk.path") as String?) ?: System.getenv("SWIFT_SDK_PATH")
+    if (configured != null) return File(configured)
+
+    val home = System.getProperty("user.home")
+    val candidates = listOf(
+        File(home, "Library/org.swift.swiftpm/swift-sdks"),
+        File(home, ".config/swiftpm/swift-sdks"),
+        File(home, ".swiftpm/swift-sdks")
+    )
+    return candidates.firstOrNull { it.isDirectory }
+        ?: throw GradleException(
+            "No Swift SDK directory found. Install the Android Swift SDK with " +
+                "`swift sdk install <url>`, or set swift.sdk.path / SWIFT_SDK_PATH."
+        )
+}
+
+/**
+ * The SDK bundle to take the runtime from. Bundle names are date-stamped, so
+ * lexicographic sort puts the newest last — the rule pyswiftkit-builder applies.
+ *
+ * It must be the toolchain that built the Swift libraries in the wheels and in
+ * the bootstrap AAR: Swift's ABI is stable on Darwin only.
+ */
+fun swiftSdkBundle(): File {
+    val root = swiftSdkRoot()
+    val configured =
+        (project.findProperty("swift.sdk") as String?) ?: System.getenv("SWIFT_ANDROID_SDK")
+    if (configured != null) {
+        val named = File(root, "$configured.artifactbundle")
+        if (!named.isDirectory) {
+            throw GradleException("Swift Android SDK not found: $named")
+        }
+        return named
+    }
+    val bundles = (root.listFiles() ?: emptyArray())
+        .filter { it.isDirectory && it.name.endsWith("_android.artifactbundle") }
+        .sortedBy { it.name }
+    return bundles.lastOrNull()
+        ?: throw GradleException(
+            "No *_android.artifactbundle in $root. Install one with " +
+                "`swift sdk install <url>`, or set swift.sdk / SWIFT_ANDROID_SDK."
+        )
+}
+
+// Resolved lazily: without this a missing Swift SDK would fail *configuration*,
+// so even `./gradlew tasks` would break on a machine that only wants to look.
+val swiftSdkBundleProvider = providers.provider { swiftSdkBundle() }
+// ─────────────────────────────────────────────────────────────────────────────"""
+
+    @staticmethod
+    def _swift_runtime_tasks(arch_values: list[str]) -> str:
+        """Copy the Swift runtime into jniLibs/<abi>, once per ABI."""
+        unsupported = [a for a in arch_values if a not in _SWIFT_ABIS]
+        if unsupported:
+            raise GradleBuildError(
+                f"No Swift Android SDK runtime for arch(es) {unsupported}. "
+                f"Supported: {sorted(_SWIFT_ABIS)}"
+            )
+
+        abi_entries = "\n".join(
+            f'    "{abi}" to SwiftAbi("{_SWIFT_ABIS[abi][1]}", "{_SWIFT_ABIS[abi][2]}"),'
+            for abi in arch_values
+        )
+        runtime_libs = ", ".join(f'"{lib}"' for lib in _SWIFT_RUNTIME_LIBS)
+
+        return """
+// ── Swift runtime staging ────────────────────────────────────────────────────
+
+val swiftRuntimeAbis = mapOf(
+{abi_entries}
+)
+
+val swiftRuntimeLibs = listOf({runtime_libs})
+
+val copySwiftRuntime = tasks.register<Copy>("copySwiftRuntime") {
+    group = "swift"
+    description = "Stage the Swift runtime from the installed SDK into jniLibs/<abi>"
+
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+
+    swiftRuntimeAbis.forEach { (abi, info) ->
+        // filter{exists}: which runtime libs a bundle ships moves between
+        // snapshots, and a missing one is not fatal here — it would have failed
+        // at link time wherever it was actually needed.
+        from(
+            swiftSdkBundleProvider.map { bundle ->
+                swiftRuntimeLibs.map { lib ->
+                    File(
+                        bundle,
+                        "swift-android/swift-resources/usr/lib/${info.runtimeDir}/android/lib$lib.so"
+                    )
+                }.filter { it.exists() }
+            }
+        ) {
+            into(abi)
+        }
+
+        // libc++_shared is an NDK library, not a Swift one, but the Swift
+        // runtime links against it and Android ships no system copy.
+        from(
+            swiftSdkBundleProvider.map { bundle ->
+                File(
+                    bundle,
+                    "swift-android/ndk-sysroot/usr/lib/${info.ndkTriple}/libc++_shared.so"
+                )
+            }
+        ) {
+            into(abi)
+        }
+    }
+
+    into(generatedJniLibsDir)
+}
+
+tasks.named("preBuild") {
+    dependsOn(copySwiftRuntime)
+}
+
+tasks.configureEach {
+    if (name.startsWith("merge") && name.endsWith("JniLibFolders")) {
+        dependsOn(copySwiftRuntime)
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+""".replace("{abi_entries}", abi_entries).replace("{runtime_libs}", runtime_libs)
+
     @staticmethod
     def _post_build_task(post_build: Path | None) -> str:
         """Gradle Exec task that runs the user's post_build hook against the
-        staged app tree, after the copySitePackages* tasks have populated
-        src/main/{assets,jniLibs,java,kotlin} but before AGP merges/packages it.
+        staged app tree, after the staging tasks have populated
+        src/main/{assets,jniLibs} and build/generated, but before AGP
+        merges/packages it.
 
         This is the Gradle-native equivalent of the xcode post-build run_script
         phase: it executes inside the build process, not in the Python CLI.
@@ -312,7 +576,8 @@ val ksprojectPostBuild = tasks.register<Exec>("ksprojectPostBuild") {{
     {command_line}
 
     // Content must be fully staged before the hook runs.
-    copySitePackagesTasks.forEach {{ dependsOn(it) }}
+    dependsOn(zipPythonAssets)
+    dependsOn(copySwiftJniLibs)
     copySitePackagesNativeLibsTasks.forEach {{ dependsOn(it) }}
     dependsOn("copySitePackagesJava")
     dependsOn("copySitePackagesKotlin")
@@ -435,8 +700,8 @@ val optimizeStagedTasks = sitePackagesAbis.map {{ abi ->
         dependsOn("stagePython_${{abi}}")
 
         val isCmdLineForced = project.hasProperty("forceCompile")
-        val isReleaseBuild = gradle.startParameter.taskNames.any {{ 
-            it.contains("Release", ignoreCase = true) 
+        val isReleaseBuild = gradle.startParameter.taskNames.any {{
+            it.contains("Release", ignoreCase = true)
         }}
         val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
 
@@ -504,9 +769,6 @@ tasks.configureEach {{
     if (name.contains("Assets") && name != "zipPythonAssets") {{
         dependsOn(zipPythonAssets)
     }}
-    if (name.startsWith("buildCMake") || name.startsWith("configureCMake") || name.startsWith("generateJsonModel")) {{
-        copySitePackagesNativeLibsTasks.forEach {{ dependsOn(it) }}
-    }}
 }}
 """
 
@@ -523,7 +785,30 @@ tasks.configureEach {{
         permissions: list[str] | None = None,
         meta_data: dict[str, str] | None = None,
         services: list["AndroidProtocol.ServiceData"] | None = None,
+        entrypoint: str | None = None,
+        presplash_name: str | None = None,
+        presplash_type: str | None = None,
+        presplash_color: str | None = None,
     ) -> None:
+        """The manifest, including the meta-data the bootstrap AAR reads.
+
+        ``org.nucleantui.NucleantActivity`` is compiled once for every app, so
+        what is per-app reaches it as manifest meta-data rather than as generated
+        constants — the same arrangement SDL uses.  MainActivity overrides
+        ``getEntryPoint()`` as well, and that wins; the meta-data is what a
+        subclass gets for free if it does not.
+        """
+        activity_meta = {}
+        if entrypoint:
+            activity_meta["org.nucleantui.entrypoint"] = entrypoint
+        if presplash_name:
+            activity_meta["org.nucleantui.presplash"] = presplash_name
+            activity_meta["org.nucleantui.presplash.type"] = presplash_type or "image"
+            activity_meta["org.nucleantui.presplash.color"] = presplash_color or "#FFFFFF"
+        activity_meta_lines = "".join(
+            f'\n            <meta-data android:name="{k}" android:value="{v}" />'
+            for k, v in activity_meta.items()
+        )
 
         perm_lines = "\n".join(
             f'    <uses-permission android:name="android.permission.{p}" />'
@@ -552,15 +837,19 @@ tasks.configureEach {{
 
         template_path = project_dir / "AndroidManifest.tmpl.xml"
 
-        if not template_path.exists():
-            print(
-                "AndroidManifest.tmpl.xml not found... Continuing with default template..."
-            )
-            default_template = """\
+        default_template = """\
 <?xml version="1.0" encoding="utf-8"?>
+<!-- ksproject-template: 2 — do not remove; the generator replaces this file when
+     its own default is newer, keeping your copy as AndroidManifest.tmpl.xml.vN.bak. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
 {{ permissions }}
+
+    <!-- Vulkan 1.1 is the floor Nucleant renders against; below it the app has
+         no rendering path at all, so keep it off those devices in the store. -->
+    <uses-feature android:name="android.hardware.vulkan.version"
+        android:version="0x401000"
+        android:required="true" />
 
     <application
         android:label="{{ app_name }}"
@@ -575,7 +864,7 @@ tasks.configureEach {{
             android:label="{{ app_name }}"
             android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|fontScale|uiMode|screenSize|smallestScreenSize|layoutDirection|density|colorMode|fontWeightAdjustment|grammaticalGender"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
-            android:exported="true">
+            android:exported="true">{{ activity_meta_data }}
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -584,14 +873,27 @@ tasks.configureEach {{
     </application>
 </manifest>
 """
-            template_path.write_text(default_template, encoding="utf-8")
-
-        template_content = template_path.read_text(encoding="utf-8")
+        template_content = _ensure_template(
+            template_path, default_template, _MANIFEST_TEMPLATE_VERSION
+        )
 
         manifest_content = template_content.replace("{{ app_name }}", app_name)
         manifest_content = manifest_content.replace("{{ permissions }}", perm_lines)
         manifest_content = manifest_content.replace("{{ meta_data }}", meta_lines)
         manifest_content = manifest_content.replace("{{ services }}", service_lines)
+        if "{{ activity_meta_data }}" in manifest_content:
+            manifest_content = manifest_content.replace(
+                "{{ activity_meta_data }}", activity_meta_lines
+            )
+        elif activity_meta_lines:
+            # A template written before the bootstrap moved into the AAR. The
+            # entry point still works (MainActivity overrides getEntryPoint),
+            # but anything read only from meta-data — the presplash — will not.
+            print(
+                "[ksproject] AndroidManifest.tmpl.xml has no {{ activity_meta_data }} "
+                "placeholder; add it inside the <activity> tag to configure the "
+                "bootstrap (presplash) from the manifest."
+            )
 
         (main_dir / "AndroidManifest.xml").write_text(
             manifest_content, encoding="utf-8"
@@ -608,1082 +910,86 @@ tasks.configureEach {{
         shutil.copy2(icon_src, mipmap_dir / "ic_launcher.png")
 
     # -------------------------------------------------------------------------
-    # MainActivity.java — extends PythonActivity (SDL2 AAR provides the class)
+    # MainActivity.java — a subclass of the AAR's NucleantActivity
     # -------------------------------------------------------------------------
 
     @staticmethod
     def write_main_activity(
         main_dir: Path,
         package_name: str,
-        python_version: str,
         python_module: str,
-        presplash_type: str | None = None,
-        presplash_name: str | None = None,
-        presplash_color: str = "#FFFFFF",
     ) -> None:
+        """A thin subclass of the bootstrap AAR's Activity.
+
+        Everything that used to be generated here — asset unpacking, the
+        environment exports, the presplash, the Python thread — now lives in
+        ``org.nucleantui.NucleantActivity``, compiled once into the bootstrap
+        AAR the way ``org.libsdl.app.SDLActivity`` is.  What is left is a place
+        for an app's own Java, and the entry point.
+
+        The entry point is stated twice on purpose: as manifest meta-data, which
+        is what the base class reads by default, and as an override here, which
+        is what an app author sees on opening the file.  The override wins, so
+        editing this one file is enough.
+        """
         java_dir = main_dir / "java" / Path(*package_name.split("."))
         java_dir.mkdir(parents=True, exist_ok=True)
 
-        show_presplash_code = ""
-        if presplash_type and presplash_name:
-            show_presplash_code = f'showLoadingScreen("{presplash_type}", "{presplash_name}", "{presplash_color}");'
+        module_name = (
+            str(python_module).strip().replace("-", "_").replace(".", "_").replace(" ", "_")
+        )
 
         content = f"""\
 package {package_name};
 
-import android.content.res.AssetManager;
-import android.os.Build;
-import android.os.Bundle;
-import android.system.ErrnoException;
-import android.system.Os;
-import android.util.Log;
-import java.io.File;
-import java.io.IOException;
-import org.kivy.android.PythonActivity;
+import org.nucleantui.NucleantActivity;
 
-public class MainActivity extends PythonActivity {{
-    private static final String TAG = "ksproject";
-
-    @Override
-    protected String[] getLibraries() {{
-        return new String[] {{
-            "SDL2",
-            "python3",
-            "main",
-        }};
-    }}
-
-    private void syncWindowLayout() {{
-        if (mActivity != null && mActivity.getWindow() != null) {{
-            android.view.Window window = mActivity.getWindow();
-
-            if (Build.VERSION.SDK_INT >= 35) {{
-                window.setDecorFitsSystemWindows(false);
-                window.setNavigationBarContrastEnforced(false);
-                window.setStatusBarContrastEnforced(false);
-            }}
-        }}
-    }}
-
-    @Override
-    protected void onResume() {{
-        super.onResume();
-        syncWindowLayout();
-    }}
-
-    @Override
-    public void onWindowFocusChanged(boolean hasFocus) {{
-        super.onWindowFocusChanged(hasFocus);
-        if (hasFocus) {{
-            syncWindowLayout();
-        }}
-    }}
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {{
-        mActivity = this;
-        syncWindowLayout();
-
-        final File appDir = new File(getFilesDir(), "app");
-        String appPath = appDir.getAbsolutePath();
-        String privatePath = getFilesDir().getAbsolutePath();
-
-        setEnv("ANDROID_APP_PATH", appPath);
-        setEnv("ANDROID_ARGUMENT", appPath);
-        setEnv("ANDROID_PRIVATE", privatePath);
-        setEnv("ANDROID_UNPACK", appPath);
-        setEnv("ANDROID_ENTRYPOINT", "{str(python_module).strip().replace('-', '_').replace('.', '_').replace(' ', '_')}");
-        setEnv("ANDROID_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir);
-        setEnv("PYTHONHOME", appPath);
-        setEnv("PYTHONNOUSERSITE", "1");
-        setEnv("PYTHONUNBUFFERED", "1");
-        setEnv("P4A_BOOTSTRAP", "SDL2");
-        setEnv("APP_ACTIVITY", "{package_name}.MainActivity");
-        setEnv("PYTHONOPTIMIZE", "2");
-
-        super.onCreate(savedInstanceState);
-
-        {show_presplash_code}
-
-        long currentUpdate = 0;
-        try {{
-            android.content.pm.PackageInfo pInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
-            currentUpdate = pInfo.lastUpdateTime;
-        }} catch (Exception e) {{
-            Log.e(TAG, "Failed to get package info", e);
-        }}
-
-        final File unpackDoneFile = new File(appDir, ".unpack_done");
-        final File versionFile = new File(appDir, ".version");
-        boolean needsUnpack = true;
-
-        if (versionFile.exists() && unpackDoneFile.exists()) {{
-            try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(versionFile))) {{
-                String stored = br.readLine();
-                if (stored != null && stored.equals(String.valueOf(currentUpdate))) {{
-                    needsUnpack = false;
-                }}
-            }} catch (IOException e) {{
-                Log.e(TAG, "Failed to read version file", e);
-            }}
-        }}
-
-        // 3. Unpack if missing or updated
-        if (needsUnpack) {{
-            // Delete unpack flag synchronously so main.c blocks immediately
-            if (unpackDoneFile.exists()) {{
-                unpackDoneFile.delete();
-            }}
-
-            final long finalUpdate = currentUpdate;
-            new Thread(new Runnable() {{
-                @Override
-                public void run() {{
-                    if (!appDir.exists()) appDir.mkdirs();
-                    try {{
-                        String abi = detectZipAbi(getAssets(), "assets.zip");
-                        if (abi == null) {{
-                            Log.e(TAG, "Could not find any matching ABI in assets.zip");
-                        }}
-
-                        extractZipAsset(getAssets(), "assets.zip", appDir, abi);
-
-                        // Write the new version timestamp
-                        try (java.io.FileWriter fw = new java.io.FileWriter(versionFile)) {{
-                            fw.write(String.valueOf(finalUpdate));
-                        }}
-
-                        // Signal to main.c that extraction is complete
-                        unpackDoneFile.createNewFile();
-                    }} catch (IOException e) {{
-                        Log.e(TAG, "asset unpack failed", e);
-                    }}
-                }}
-            }}).start();
-        }}
-    }}
+/**
+ * This app's Activity.
+ *
+ * <p>Everything that starts a Nucleant app — unpacking the Python tree, the
+ * environment, the render surface, the interpreter thread — lives in
+ * {{@link NucleantActivity}}, which ships prebuilt in the bootstrap AAR. This
+ * class exists so there is somewhere to put Java of your own.
+ *
+ * <p>Regenerating the project overwrites this file. Every startup step is a
+ * protected hook on the base class:
+ *
+ * <pre>{{@code
+ * protected void onPythonStarting() {{
+ *     super.onPythonStarting();
+ *     // permissions, billing, anything that must happen before Python runs
+ * }}
+ *
+ * protected void onSetupEnvironment(File appDir) {{
+ *     super.onSetupEnvironment(appDir);
+ *     setEnv("MY_FLAG", "1");
+ * }}
+ * }}</pre>
+ *
+ * <p>See also onCreateSurfaceView(), onCreatePresplashView() and
+ * onPythonExited(int).
+ */
+public class MainActivity extends NucleantActivity {{
 
     /**
-     * Scans the zip file without extracting to determine which compiled ABIs are available.
-     * Matches against the device's supported ABIs to find the best match.
+     * The Python module run as {{@code __main__}}, from pyproject's project
+     * name. The manifest carries the same value as
+     * {{@code org.nucleantui.entrypoint}} meta-data; this override is the one
+     * that wins.
      */
-    private static String detectZipAbi(AssetManager am, String zipFileName) {{
-        java.util.List<String> zipAbis = new java.util.ArrayList<>();
-        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(am.open(zipFileName))) {{
-            java.util.zip.ZipEntry entry;
-            while ((entry = zis.getNextEntry()) != null) {{
-                String name = entry.getName();
-                if (name.startsWith("site-packages/")) {{
-                    String[] parts = name.split("/");
-                    if (parts.length > 1 && !zipAbis.contains(parts[1])) {{
-                        zipAbis.add(parts[1]);
-                    }}
-                }}
-            }}
-        }} catch (Exception e) {{
-            Log.e(TAG, "Failed to scan zip ABIs", e);
-        }}
-
-        for (String supported : Build.SUPPORTED_ABIS) {{
-            if (zipAbis.contains(supported)) return supported;
-        }}
-        return zipAbis.isEmpty() ? null : zipAbis.get(0);
-    }}
-
-    /**
-     * Extracts the zip file, filtering and remapping ABI-specific folders
-     * so they match the legacy file structure CPython expects.
-     */
-    private static void extractZipAsset(AssetManager am, String zipFileName, File destDir, String abi) throws IOException {{
-        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new java.io.BufferedInputStream(am.open(zipFileName)))) {{
-            java.util.zip.ZipEntry entry;
-            byte[] buffer = new byte[32768]; // 32KB chunking for fast I/O
-
-            while ((entry = zis.getNextEntry()) != null) {{
-                String name = entry.getName();
-
-                if (name.startsWith("site-packages/")) {{
-                    if (abi == null || !name.startsWith("site-packages/" + abi + "/")) continue;
-                    name = "site-packages/" + name.substring(("site-packages/" + abi + "/").length());
-                }}
-                else if (name.startsWith("lib-dynload/")) {{
-                    if (abi == null || !name.startsWith("lib-dynload/" + abi + "/")) continue;
-                    name = "python{python_version}/lib-dynload/" + name.substring(("lib-dynload/" + abi + "/").length());
-                }}
-
-                if (name.isEmpty() || name.endsWith("/")) {{
-                    File d = new File(destDir, name);
-                    if (!d.exists()) d.mkdirs();
-                    continue;
-                }}
-
-                File outFile = new File(destDir, name);
-                File parent = outFile.getParentFile();
-                if (parent != null && !parent.exists()) {{
-                    parent.mkdirs();
-                }}
-
-                try (java.io.FileOutputStream fos = new java.io.FileOutputStream(outFile);
-                     java.io.BufferedOutputStream bos = new java.io.BufferedOutputStream(fos, buffer.length)) {{
-                    int len;
-                    while ((len = zis.read(buffer)) > 0) {{
-                        bos.write(buffer, 0, len);
-                    }}
-                }}
-            }}
-        }}
-    }}
-
-    private static void setEnv(String name, String value) {{
-        try {{
-            Os.setenv(name, value, true);
-        }} catch (ErrnoException e) {{
-            Log.e(TAG, "setenv " + name + " failed", e);
-        }}
+    @Override
+    protected String getEntryPoint() {{
+        return "{module_name}";
     }}
 }}
 """
-        dest = java_dir / "MainActivity.java"
-        dest.write_text(content, encoding="utf-8")
+        (java_dir / "MainActivity.java").write_text(content, encoding="utf-8")
+
 
     # -------------------------------------------------------------------------
-    # Hardware.java — org.renpy.android.Hardware shim for p4a compatibility
+    # Per-service subclasses generated from pyproject
     # -------------------------------------------------------------------------
-
-    @staticmethod
-    def write_renpy_hardware(main_dir: Path, package_name: str) -> None:
-        """
-        Comprehensive org.renpy.android.Hardware shim matching older p4a behavior.
-        Updated for modern Android API compliance while maintaining strict
-        backward compatibility with Pyjnius calls from Kivy/Plyer.
-        """
-        java_dir = main_dir / "java" / "org" / "renpy" / "android"
-        java_dir.mkdir(parents=True, exist_ok=True)
-
-        content = """\
-package org.renpy.android;
-
-import android.content.BroadcastReceiver;
-import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.hardware.Sensor;
-import android.hardware.SensorEvent;
-import android.hardware.SensorEventListener;
-import android.hardware.SensorManager;
-import android.net.ConnectivityManager;
-import android.net.Network;
-import android.net.NetworkCapabilities;
-import android.net.NetworkInfo;
-import android.net.wifi.ScanResult;
-import android.net.wifi.WifiManager;
-import android.os.Build;
-import android.os.VibrationEffect;
-import android.os.Vibrator;
-import android.util.DisplayMetrics;
-import android.view.View;
-import android.view.inputmethod.InputMethodManager;
-import java.util.List;
-import org.kivy.android.PythonActivity;
-
-public class Hardware {
-
-    public static Context context;
-    public static View view;
-    public static final float defaultRv[] = {0f, 0f, 0f};
-
-    private static Context getContext() {
-        if (context != null) return context;
-        return PythonActivity.mActivity;
-    }
-
-    private static View getView() {
-        if (view != null) return view;
-        if (PythonActivity.mActivity != null) {
-            return PythonActivity.mActivity.getWindow().getDecorView();
-        }
-        return null;
-    }
-
-    /** Vibrate for s seconds. Modernized for API 26+ */
-    public static void vibrate(double s) {
-        if (getContext() != null) {
-            Vibrator v = (Vibrator) getContext().getSystemService(Context.VIBRATOR_SERVICE);
-            if (v != null) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    v.vibrate(VibrationEffect.createOneShot((long) (1000 * s), VibrationEffect.DEFAULT_AMPLITUDE));
-                } else {
-                    v.vibrate((long) (1000 * s));
-                }
-            }
-        }
-    }
-
-    /** Get an Overview of all Hardware Sensors */
-    public static String getHardwareSensors() {
-        if (getContext() == null) return "";
-        SensorManager sm = (SensorManager) getContext().getSystemService(Context.SENSOR_SERVICE);
-        List<Sensor> allSensors = sm.getSensorList(Sensor.TYPE_ALL);
-
-        if (allSensors != null) {
-            StringBuilder resultString = new StringBuilder();
-            for (Sensor s : allSensors) {
-                resultString.append(String.format("Name=%s,Vendor=%s,Version=%d,MaximumRange=%f,Power=%f,Type=%d\\n",
-                        s.getName(), s.getVendor(), s.getVersion(), s.getMaximumRange(), s.getPower(), s.getType()));
-            }
-            return resultString.toString();
-        }
-        return "";
-    }
-
-    public static class generic3AxisSensor implements SensorEventListener {
-        private final SensorManager sSensorManager;
-        private final Sensor sSensor;
-        private final int sSensorType;
-        SensorEvent sSensorEvent;
-
-        public generic3AxisSensor(int sensorType) {
-            sSensorType = sensorType;
-            sSensorManager = (SensorManager) getContext().getSystemService(Context.SENSOR_SERVICE);
-            sSensor = sSensorManager.getDefaultSensor(sSensorType);
-        }
-
-        public void onAccuracyChanged(Sensor sensor, int accuracy) {}
-
-        public void onSensorChanged(SensorEvent event) {
-            sSensorEvent = event;
-        }
-
-        public void changeStatus(boolean enable) {
-            if (sSensor == null) return;
-            if (enable) {
-                sSensorManager.registerListener(this, sSensor, SensorManager.SENSOR_DELAY_NORMAL);
-            } else {
-                sSensorManager.unregisterListener(this, sSensor);
-            }
-        }
-
-        public float[] readSensor() {
-            if (sSensorEvent != null) {
-                return sSensorEvent.values;
-            } else {
-                return defaultRv;
-            }
-        }
-    }
-
-    public static generic3AxisSensor accelerometerSensor = null;
-    public static generic3AxisSensor orientationSensor = null;
-    public static generic3AxisSensor magneticFieldSensor = null;
-
-    public static void accelerometerEnable(boolean enable) {
-        if (accelerometerSensor == null) accelerometerSensor = new generic3AxisSensor(Sensor.TYPE_ACCELEROMETER);
-        accelerometerSensor.changeStatus(enable);
-    }
-
-    public static float[] accelerometerReading() {
-        if (accelerometerSensor == null) return defaultRv;
-        return accelerometerSensor.readSensor();
-    }
-
-    public static void orientationSensorEnable(boolean enable) {
-        if (orientationSensor == null) orientationSensor = new generic3AxisSensor(Sensor.TYPE_ORIENTATION);
-        orientationSensor.changeStatus(enable);
-    }
-
-    public static float[] orientationSensorReading() {
-        if (orientationSensor == null) return defaultRv;
-        return orientationSensor.readSensor();
-    }
-
-    public static void magneticFieldSensorEnable(boolean enable) {
-        if (magneticFieldSensor == null) magneticFieldSensor = new generic3AxisSensor(Sensor.TYPE_MAGNETIC_FIELD);
-        magneticFieldSensor.changeStatus(enable);
-    }
-
-    public static float[] magneticFieldSensorReading() {
-        if (magneticFieldSensor == null) return defaultRv;
-        return magneticFieldSensor.readSensor();
-    }
-
-    public static DisplayMetrics metrics = new DisplayMetrics();
-
-    public static int getDPI() {
-        if (PythonActivity.mActivity != null) {
-            PythonActivity.mActivity.getWindowManager().getDefaultDisplay().getMetrics(metrics);
-            return metrics.densityDpi;
-        }
-        return 160;
-    }
-
-    public static void hideKeyboard() {
-        if (getContext() != null && getView() != null) {
-            InputMethodManager imm = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
-            if (imm != null) {
-                imm.hideSoftInputFromWindow(getView().getWindowToken(), 0);
-            }
-        }
-    }
-
-    static List<ScanResult> latestResult;
-
-    public static void enableWifiScanner() {
-        if (getContext() == null) return;
-        IntentFilter i = new IntentFilter();
-        i.addAction(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION);
-
-        getContext().registerReceiver(new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context c, Intent i) {
-                try {
-                    WifiManager w = (WifiManager) c.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-                    if (w != null) {
-                        latestResult = w.getScanResults(); 
-                    }
-                } catch (SecurityException e) {
-                    // Modern Android requires ACCESS_FINE_LOCATION to scan WiFi
-                }
-            }
-        }, i);
-    }
-
-    public static String scanWifi() {
-        if (latestResult != null) {
-            StringBuilder latestResultString = new StringBuilder();
-            for (ScanResult result : latestResult) {
-                latestResultString.append(String.format("%s\\t%s\\t%d\\n", result.SSID, result.BSSID, result.level));
-            }
-            return latestResultString.toString();
-        }
-        return "";
-    }
-
-    public static boolean network_state = false;
-
-    /**
-     * Modernized Network check using NetworkCapabilities for API >= 23, 
-     * falling back to activeNetworkInfo for older devices.
-     */
-    public static boolean checkNetwork() {
-        if (getContext() == null) return false;
-        ConnectivityManager conMgr = (ConnectivityManager) getContext().getSystemService(Context.CONNECTIVITY_SERVICE);
-        if (conMgr == null) return false;
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Network network = conMgr.getActiveNetwork();
-            if (network == null) return false;
-            NetworkCapabilities capabilities = conMgr.getNetworkCapabilities(network);
-            return capabilities != null && (
-                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
-                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET));
-        } else {
-            NetworkInfo activeNetwork = conMgr.getActiveNetworkInfo();
-            return activeNetwork != null && activeNetwork.isConnected();
-        }
-    }
-
-    /** * Modernized Network listener using NetworkCallback for API >= 24, 
-     * falling back to CONNECTIVITY_ACTION BroadcastReceiver for older devices.
-     */
-    public static void registerNetworkCheck() {
-        if (getContext() == null) return;
-        network_state = checkNetwork();
-        
-        ConnectivityManager conMgr = (ConnectivityManager) getContext().getSystemService(Context.CONNECTIVITY_SERVICE);
-        if (conMgr == null) return;
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            conMgr.registerDefaultNetworkCallback(new ConnectivityManager.NetworkCallback() {
-                @Override
-                public void onAvailable(Network network) {
-                    network_state = true;
-                }
-                @Override
-                public void onLost(Network network) {
-                    network_state = false;
-                }
-            });
-        } else {
-            IntentFilter i = new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION);
-            getContext().registerReceiver(new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context c, Intent i) {
-                    network_state = checkNetwork();
-                }
-            }, i);
-        }
-    }
-}
-"""
-        (java_dir / "Hardware.java").write_text(content, encoding="utf-8")
-
-    # -------------------------------------------------------------------------
-    # PythonActivity.java — org.kivy.android.PythonActivity shim
-    # -------------------------------------------------------------------------
-
-    @staticmethod
-    def write_kivy_python_activity(main_dir: Path, package_name: str) -> None:
-        """Minimal org.kivy.android.PythonActivity that exposes mActivity to
-        Kivy's fontscale lookup via pyjnius, combining native p4a lifecycle safety
-        with dynamic Lottie/GIF/Image loading screens, ActivityResult hooks, and NewIntent hooks.
-        """
-        java_dir = main_dir / "java" / "org" / "kivy" / "android"
-        java_dir.mkdir(parents=True, exist_ok=True)
-
-        content = f"""\
-package org.kivy.android;
-
-import android.app.Activity;
-import org.libsdl.app.SDLActivity;
-import android.content.pm.PackageManager;
-import android.util.Log;
-import android.content.Context;
-import android.content.res.Configuration;
-import android.view.inputmethod.InputMethodManager;
-import android.view.View;
-import android.view.ViewGroup;
-import android.widget.FrameLayout;
-import android.widget.ImageView;
-import android.graphics.Color;
-import android.os.Build;
-import android.os.Bundle;
-import android.content.Intent;
-import java.util.ArrayList;
-import java.util.List;
-
-public class PythonActivity extends SDLActivity {{
-    public static PythonActivity mActivity;
-    public static final String TAG = "PythonActivity";
-    
-    private View loadingView = null;
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {{
-        super.onCreate(savedInstanceState);
-        mActivity = this;
-    }}
-
-    public static PythonActivity getActivity() {{
-        return mActivity;
-    }}
-
-    protected void showLoadingScreen(View view) {{
-        try {{
-            if (mLayout == null) {{
-                setContentView(view);
-            }} else if (view.getParent() == null) {{
-                mLayout.addView(view);
-            }}
-        }} catch (IllegalStateException e) {{
-            // The loading screen can be attempted to be applied twice if app
-            // is tabbed in/out, quickly.
-            // (Gives error "The specified child already has a parent.
-            // You must call removeView() on the child's parent first.")
-            Log.w(TAG, "Loading screen attempted to be applied twice.");
-        }}
-    }}
-
-    /**
-     * Show custom loading screen overlay using the safe p4a application method.
-     * @param type "lottie", "gif", or "image"
-     * @param resourceName filename without extension (e.g. "loading_anim")
-     * @param bgColor Hex color string for background (e.g. "#FFFFFF")
-     */
-    public void showLoadingScreen(final String type, final String resourceName, final String bgColor) {{
-        runOnUiThread(new Runnable() {{
-            @Override
-            public void run() {{
-                // If the view already exists (e.g., resuming app), just re-apply it safely
-                if (loadingView != null) {{
-                    showLoadingScreen(loadingView);
-                    return;
-                }}
-
-                FrameLayout frameLayout = new FrameLayout(mActivity);
-                
-                // Force the background layout to fill the entire screen
-                frameLayout.setLayoutParams(new ViewGroup.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT
-                ));
-
-                try {{
-                    frameLayout.setBackgroundColor(Color.parseColor(bgColor));
-                }} catch (Exception e) {{
-                    frameLayout.setBackgroundColor(Color.WHITE);
-                }}
-
-                FrameLayout.LayoutParams centerParams = new FrameLayout.LayoutParams(
-                        FrameLayout.LayoutParams.WRAP_CONTENT,
-                        FrameLayout.LayoutParams.WRAP_CONTENT,
-                        android.view.Gravity.CENTER
-                );
-
-                int resId = getResources().getIdentifier(resourceName, "drawable", getPackageName());
-                int rawResId = getResources().getIdentifier(resourceName, "raw", getPackageName());
-
-                try {{
-                    if ("lottie".equalsIgnoreCase(type)) {{
-                        try {{
-                            Class<?> lottieClass = Class.forName("com.airbnb.lottie.LottieAnimationView");
-                            View lottieView = (View) lottieClass.getConstructor(Context.class).newInstance(mActivity);
-                            
-                            if (rawResId != 0) {{
-                                lottieClass.getMethod("setAnimation", int.class).invoke(lottieView, rawResId);
-                            }} else {{
-                                lottieClass.getMethod("setAnimation", String.class).invoke(lottieView, resourceName + ".json");
-                            }}
-                            
-                            lottieClass.getMethod("setRepeatCount", int.class).invoke(lottieView, -1);
-                            lottieClass.getMethod("playAnimation").invoke(lottieView);
-                            frameLayout.addView(lottieView, centerParams);
-                        }} catch (ClassNotFoundException e) {{
-                            Log.e(TAG, "Lottie class not found. Ensure it is in your gradle dependencies.");
-                        }}
-                        
-                    }} else if ("gif".equalsIgnoreCase(type)) {{
-                        ImageView imageView = new ImageView(mActivity);
-                        if (Build.VERSION.SDK_INT >= 28 && resId != 0) {{
-                            android.graphics.ImageDecoder.Source source = android.graphics.ImageDecoder.createSource(getResources(), resId);
-                            android.graphics.drawable.Drawable drawable = android.graphics.ImageDecoder.decodeDrawable(source);
-                            imageView.setImageDrawable(drawable);
-                            if (drawable instanceof android.graphics.drawable.AnimatedImageDrawable) {{
-                                ((android.graphics.drawable.AnimatedImageDrawable) drawable).start();
-                            }}
-                        }} else {{
-                            if (resId != 0) imageView.setImageResource(resId);
-                        }}
-                        frameLayout.addView(imageView, centerParams);
-                        
-                    }} else {{
-                        ImageView imageView = new ImageView(mActivity);
-                        if (resId != 0) imageView.setImageResource(resId);
-                        frameLayout.addView(imageView, centerParams);
-                    }}
-
-                    loadingView = frameLayout;
-                    
-                    // Route the newly constructed View through the safe p4a method
-                    showLoadingScreen(loadingView);
-                    Log.v(TAG, "Loading screen constructed and displayed: " + type);
-
-                }} catch (Exception e) {{
-                    Log.e(TAG, "Error creating loading screen: " + e.getMessage());
-                }}
-            }}
-        }});
-    }}
-
-    public void removeLoadingScreen() {{
-        runOnUiThread(new Runnable() {{
-            @Override
-            public void run() {{
-                if (loadingView != null && loadingView.getParent() != null) {{
-                    loadingView.animate()
-                        .alpha(0f)
-                        .setDuration(300)
-                        .withEndAction(new Runnable() {{
-                            @Override
-                            public void run() {{
-                                if (loadingView != null && loadingView.getParent() != null) {{
-                                    ((ViewGroup) loadingView.getParent()).removeView(loadingView);
-                                    loadingView = null;
-                                    Log.v(TAG, "Loading screen successfully removed");
-                                }}
-                            }}
-                        }})
-                        .start();
-                }}
-            }}
-        }});
-    }}
-
-    /**
-     * Used by external Python/Java modules to intercept Activity Results
-     */
-    public interface ActivityResultListener {{
-        void onActivityResult(int requestCode, int resultCode, Intent data);
-    }}
-
-    private List<ActivityResultListener> activityResultListeners = new ArrayList<ActivityResultListener>();
-
-    public void registerActivityResultListener(ActivityResultListener listener) {{
-        synchronized (activityResultListeners) {{
-            activityResultListeners.add(listener);
-        }}
-        Log.v(TAG, "registerActivityResultListener(): Added listener");
-    }}
-
-    public void unregisterActivityResultListener(ActivityResultListener listener) {{
-        synchronized (activityResultListeners) {{
-            activityResultListeners.remove(listener);
-        }}
-        Log.v(TAG, "unregisterActivityResultListener(): Removed listener");
-    }}
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent intent) {{
-        Log.v(TAG, "onActivityResult()");
-        List<ActivityResultListener> listenersCopy;
-        
-        synchronized (activityResultListeners) {{
-            listenersCopy = new ArrayList<>(activityResultListeners);
-        }}
-        
-        for (ActivityResultListener listener : listenersCopy) {{
-            listener.onActivityResult(requestCode, resultCode, intent);
-        }}
-        super.onActivityResult(requestCode, resultCode, intent);
-    }}
-
-    /**
-     * Used by external Python/Java modules to intercept New Intents (e.g., Deep Links)
-     */
-    public interface NewIntentListener {{
-        void onNewIntent(Intent intent);
-    }}
-
-    private List<NewIntentListener> newIntentListeners = new ArrayList<NewIntentListener>();
-
-    public void registerNewIntentListener(NewIntentListener listener) {{
-        synchronized (newIntentListeners) {{
-            newIntentListeners.add(listener);
-        }}
-        Log.v(TAG, "registerNewIntentListener(): Added listener");
-    }}
-
-    public void unregisterNewIntentListener(NewIntentListener listener) {{
-        synchronized (newIntentListeners) {{
-            newIntentListeners.remove(listener);
-        }}
-        Log.v(TAG, "unregisterNewIntentListener(): Removed listener");
-    }}
-
-    @Override
-    protected void onNewIntent(Intent intent) {{
-        Log.v(TAG, "onNewIntent()");
-        List<NewIntentListener> listenersCopy;
-        
-        synchronized (newIntentListeners) {{
-            listenersCopy = new ArrayList<>(newIntentListeners);
-        }}
-        
-        for (NewIntentListener listener : listenersCopy) {{
-            listener.onNewIntent(intent);
-        }}
-        super.onNewIntent(intent);
-    }}
-
-    /**
-     * Used by external Python/Java modules to intercept Dark Mode / Night Mode shifts
-     */
-    public interface DarkModeListener {{
-        void onDarkModeChanged(boolean isDarkMode);
-    }}
-
-    private List<DarkModeListener> darkModeListeners = new ArrayList<DarkModeListener>();
-
-    public void registerDarkModeListener(DarkModeListener listener) {{
-        synchronized (darkModeListeners) {{
-            darkModeListeners.add(listener);
-        }}
-        Log.v(TAG, "registerDarkModeListener(): Added listener");
-    }}
-
-    public void unregisterDarkModeListener(DarkModeListener listener) {{
-        synchronized (darkModeListeners) {{
-            darkModeListeners.remove(listener);
-        }}
-        Log.v(TAG, "unregisterDarkModeListener(): Removed listener");
-    }}
-
-    /**
-     * Direct synchronous check helper for Kivy on startup initialization
-     */
-    public boolean isDarkMode() {{
-        int nightModeFlags = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
-        return nightModeFlags == Configuration.UI_MODE_NIGHT_YES;
-    }}
-
-    @Override
-    public void onConfigurationChanged(Configuration newConfig) {{
-        super.onConfigurationChanged(newConfig);
-        Log.v(TAG, "onConfigurationChanged()");
-
-        int nightModeFlags = newConfig.uiMode & Configuration.UI_MODE_NIGHT_MASK;
-        boolean isDarkModeActive = (nightModeFlags == Configuration.UI_MODE_NIGHT_YES);
-
-        List<DarkModeListener> listenersCopy;
-        synchronized (darkModeListeners) {{
-            listenersCopy = new ArrayList<>(darkModeListeners);
-        }}
-        
-        for (DarkModeListener listener : listenersCopy) {{
-            listener.onDarkModeChanged(isDarkModeActive);
-        }}
-    }}
-
-    /**
-     * Used by android.permissions module to register a call back after requesting runtime
-     * permissions
-     */
-    public interface PermissionsCallback {{
-        void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults);
-    }}
-
-    private PermissionsCallback permissionCallback;
-    private boolean havePermissionsCallback = false;
-
-    public void addPermissionsCallback(PermissionsCallback callback) {{
-        permissionCallback = callback;
-        havePermissionsCallback = true;
-        Log.v(TAG, "addPermissionsCallback(): Added callback for onRequestPermissionsResult");
-    }}
-
-    @Override
-    public void onRequestPermissionsResult(
-            int requestCode, String[] permissions, int[] grantResults) {{
-        Log.v(TAG, "onRequestPermissionsResult()");
-        if (havePermissionsCallback) {{
-            Log.v(TAG, "onRequestPermissionsResult passed to callback");
-            permissionCallback.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        }}
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-    }}
-
-    /** Used by android.permissions module to check a permission */
-    public boolean checkCurrentPermission(String permission) {{
-        return checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED;
-    }}
-
-    /** Used by android.permissions module to request runtime permissions */
-    public void requestPermissionsWithRequestCode(String[] permissions, int requestCode) {{
-        requestPermissions(permissions, requestCode);
-    }}
-
-    public void requestPermissions(String[] permissions) {{
-        requestPermissionsWithRequestCode(permissions, 1);
-    }}
-
-    public static void changeKeyboard(int inputType) {{
-        // empty
-    }}
-}}
-"""
-        (java_dir / "PythonActivity.java").write_text(content, encoding="utf-8")
-
-    @staticmethod
-    def write_kivy_python_service(main_dir: Path) -> None:
-        """Base PythonService matching p4a architecture with critical SDL/Pyjnius hooks."""
-        java_dir = main_dir / "java" / "org" / "kivy" / "android"
-        java_dir.mkdir(parents=True, exist_ok=True)
-        content = """\
-package org.kivy.android;
-
-import android.app.Notification;
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-import android.app.PendingIntent;
-import android.app.Service;
-import android.content.Context;
-import android.content.Intent;
-import android.graphics.Color;
-import android.os.Build;
-import android.os.Bundle;
-import android.os.IBinder;
-import android.os.Process;
-import android.util.Log;
-import android.system.Os;
-import android.system.ErrnoException;
-import java.io.File;
-import java.lang.reflect.Method;
-import java.lang.reflect.InvocationTargetException;
-import org.libsdl.app.SDL;
-
-public class PythonService extends Service implements Runnable {
-
-    private Thread pythonThread = null;
-
-    private String androidPrivate;
-    private String serviceEntrypoint;
-    private String pythonVersion;
-    private String pythonName;
-
-    public static PythonService mService = null;
-    private Intent startIntent = null;
-    private boolean autoRestartService = false;
-
-    static {
-        System.loadLibrary("SDL2");
-        System.loadLibrary("python3");
-        System.loadLibrary("service_main");
-    }
-
-    public void setAutoRestartService(boolean restart) {
-        autoRestartService = restart;
-    }
-
-    public int startType() {
-        return START_NOT_STICKY;
-    }
-
-    @Override
-    public IBinder onBind(Intent arg0) {
-        return null;
-    }
-
-    @Override
-    public void onCreate() {
-        super.onCreate();
-        SDL.setContext(this);
-    }
-
-    @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
-        if (pythonThread != null) {
-            Log.v("python service", "service exists, do not start again");
-            return startType();
-        }
-        if (intent == null) {
-            Context context = getApplicationContext();
-            intent = getThisDefaultIntent(context, "");
-        }
-
-        startIntent = intent;
-        Bundle extras = intent.getExtras();
-        if (extras != null) {
-            androidPrivate = extras.getString("androidPrivate");
-            serviceEntrypoint = extras.getString("serviceEntrypoint");
-            pythonVersion = extras.getString("pythonVersion");
-            pythonName = extras.getString("pythonName");
-            
-            boolean serviceStartAsForeground = false;
-            if (extras.containsKey("serviceStartAsForeground")) {
-                serviceStartAsForeground = extras.getString("serviceStartAsForeground").equals("true");
-            }
-
-            pythonThread = new Thread(this);
-            pythonThread.start();
-
-            if (serviceStartAsForeground) {
-                doStartForeground(extras);
-            }
-        }
-
-        return startType();
-    }
-
-    protected int getServiceId() {
-        // Fallback: Generate a dynamic, stable ID based on the python name
-        if (pythonName != null && !pythonName.isEmpty()) {
-            return Math.abs(pythonName.hashCode()) % 10000 + 1;
-        }
-        return 1;
-    }
-
-    protected Intent getThisDefaultIntent(Context ctx, String pythonServiceArgument) {
-        return null;
-    }
-
-    protected void doStartForeground(Bundle extras) {
-        String serviceTitle = extras.getString("serviceTitle");
-        String smallIconName = extras.getString("smallIconName");
-        String contentTitle = extras.getString("contentTitle");
-        String contentText = extras.getString("contentText");
-        Notification notification;
-        Context context = getApplicationContext();
-        Intent contextIntent = new Intent(context, PythonActivity.class);
-        PendingIntent pIntent = PendingIntent.getActivity(
-                context, 0, contextIntent,
-                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-
-        int smallIconId = context.getApplicationInfo().icon;
-        if (smallIconName != null && !smallIconName.equals("")) {
-            int resId = getResources().getIdentifier(smallIconName, "mipmap", getPackageName());
-            if (resId == 0) {
-                resId = getResources().getIdentifier(smallIconName, "drawable", getPackageName());
-            }
-            if (resId != 0) {
-                smallIconId = resId;
-            }
-        }
-
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            notification = new Notification(smallIconId, serviceTitle, System.currentTimeMillis());
-            try {
-                Method func = notification.getClass().getMethod(
-                        "setLatestEventInfo", Context.class, CharSequence.class, CharSequence.class, PendingIntent.class);
-                func.invoke(notification, context, contentTitle, contentText, pIntent);
-            } catch (Exception e) {
-                Log.e("python service", "Notification legacy setup failed", e);
-            }
-        } else {
-            String NOTIFICATION_CHANNEL_ID = "org.kivy.p4a" + getServiceId();
-            String channelName = "Background Service" + getServiceId();
-            NotificationChannel chan = new NotificationChannel(
-                    NOTIFICATION_CHANNEL_ID, channelName, NotificationManager.IMPORTANCE_NONE);
-
-            chan.setLightColor(Color.BLUE);
-            chan.setLockscreenVisibility(Notification.VISIBILITY_PRIVATE);
-            NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-            manager.createNotificationChannel(chan);
-
-            Notification.Builder builder = new Notification.Builder(context, NOTIFICATION_CHANNEL_ID);
-            builder.setContentTitle(contentTitle);
-            builder.setContentText(contentText);
-            builder.setContentIntent(pIntent);
-            builder.setSmallIcon(smallIconId);
-            notification = builder.build();
-        }
-        startForeground(getServiceId(), notification);
-    }
-
-    @Override
-    public void onDestroy() {
-        super.onDestroy();
-        pythonThread = null;
-        if (autoRestartService && startIntent != null) {
-            Log.v("python service", "service restart requested");
-            startService(startIntent);
-        }
-        Process.killProcess(Process.myPid());
-    }
-
-    @Override
-    public void onTaskRemoved(Intent rootIntent) {
-        super.onTaskRemoved(rootIntent);
-        if (startType() != START_STICKY) {
-            stopSelf();
-        }
-    }
-
-    @Override
-    public void run() {
-
-        SDL.setupJNI();
-
-        try {
-            Os.setenv("ANDROID_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir, true);
-        } catch (ErrnoException e) {
-            Log.e("python service", "setenv ANDROID_NATIVE_LIB_DIR failed", e);
-        }
-
-        this.mService = this;
-        nativeStart(
-                androidPrivate,
-                serviceEntrypoint,
-                pythonVersion);
-        stopSelf();
-    }
-
-    public static native void nativeStart(
-            String androidPrivate,
-            String entrypoint,
-            String pyVersion);
-}
-"""
-        (java_dir / "PythonService.java").write_text(content, encoding="utf-8")
 
     @staticmethod
     def write_custom_service(
@@ -1701,40 +1007,34 @@ public class PythonService extends Service implements Runnable {
         java_dir = main_dir / "java" / Path(*package_name.split("."))
         java_dir.mkdir(parents=True, exist_ok=True)
 
-        foreground_imports = ""
-        foreground_logic = ""
-
         start_type_constant = start_type.upper()
         is_sticky_bool_str = (
             "true" if start_type_constant == "START_STICKY" else "false"
         )
+        foreground_str = "true" if foreground else "false"
 
         title = notification_title or f"{service_name} is running"
         text = notification_text or "Background task active"
 
-        # Calculate a stable, unique integer for this specific service at generation time
+        # A stable, unique notification id per service, fixed at generation
+        # time so a restart reuses the same notification instead of stacking.
         unique_service_id = (
             zlib.crc32(service_name.lower().encode("utf-8")) % 10000
         ) + 1
 
+        foreground_logic = ""
         if foreground:
-            foreground_imports = """
-import android.app.Notification;
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-"""
             foreground_logic = f"""
         String channelId = "{package_name}.{service_name}";
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {{
-            NotificationChannel channel = new NotificationChannel(
-                channelId,
-                "{service_name} Channel",
-                NotificationManager.IMPORTANCE_LOW
-            );
-            NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-            if (manager != null) {{
-                manager.createNotificationChannel(channel);
-            }}
+        NotificationChannel channel = new NotificationChannel(
+            channelId,
+            "{service_name} Channel",
+            NotificationManager.IMPORTANCE_LOW
+        );
+        NotificationManager manager =
+                (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager != null) {{
+            manager.createNotificationChannel(channel);
         }}
 
         int iconId = getResources().getIdentifier("{notification_icon}", "drawable", "android");
@@ -1742,46 +1042,44 @@ import android.app.NotificationManager;
             iconId = android.R.drawable.stat_notify_sync;
         }}
 
-        // Prioritize dynamic Intent titles (if launched from Python), otherwise use our Python defaults
-        String finalTitle = intent.hasExtra("serviceTitle") ? intent.getStringExtra("serviceTitle") : "{title}";
-        String finalText = intent.hasExtra("serviceDescription") ? intent.getStringExtra("serviceDescription") : "{text}";
+        // A title passed in the Intent (started from Python) wins over the
+        // generated default, which is what the system's own restart uses.
+        String finalTitle = intent.hasExtra("serviceTitle")
+                ? intent.getStringExtra("serviceTitle") : "{title}";
+        String finalText = intent.hasExtra("serviceDescription")
+                ? intent.getStringExtra("serviceDescription") : "{text}";
 
-        Notification notification;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {{
-            notification = new Notification.Builder(this, channelId)
-                .setContentTitle(finalTitle)
-                .setContentText(finalText)
-                .setSmallIcon(iconId)
-                .build();
-        }} else {{
-            notification = new Notification.Builder(this)
-                .setContentTitle(finalTitle)
-                .setContentText(finalText)
-                .setSmallIcon(iconId)
-                .build();
-        }}
+        Notification notification = new Notification.Builder(this, channelId)
+            .setContentTitle(finalTitle)
+            .setContentText(finalText)
+            .setSmallIcon(iconId)
+            .build();
 
         startForeground({unique_service_id}, notification);
 
+        // Already foregrounded here; stop the base class doing it again.
         intent.putExtra("serviceStartAsForeground", "false");
 """
 
         content = f"""\
 package {package_name};
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
-import org.kivy.android.PythonService;
-import java.io.File;{foreground_imports}
 
-public class {service_name} extends PythonService {{
-    
+import org.nucleantui.NucleantService;
+
+public class {service_name} extends NucleantService {{
+
     @Override
     public int startType() {{
         return {start_type_constant};
     }}
-    
+
     @Override
     protected int getServiceId() {{
         return {unique_service_id};
@@ -1794,21 +1092,22 @@ public class {service_name} extends PythonService {{
         intent.putExtra("serviceEntrypoint", "{entrypoint}");
         intent.putExtra("pythonVersion", "{python_version}");
         intent.putExtra("pythonName", "{service_name.lower()}");
-        
-        // Set fallback titles for when the system auto-restarts the service
+        intent.putExtra("pythonServiceArgument", pythonServiceArgument);
+
+        // Fallbacks for when the system auto-restarts the service and there is
+        // no caller to supply them.
         intent.putExtra("serviceTitle", "{title}");
         intent.putExtra("serviceDescription", "{text}");
-        intent.putExtra("serviceStartAsForeground", "{'true' if foreground else 'false'}");
-        
+        intent.putExtra("serviceStartAsForeground", "{foreground_str}");
+
         return intent;
     }}
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {{
-        if (intent == null || intent.getExtras() == null || !intent.hasExtra("pythonName")) {{
+        if (intent == null || intent.getExtras() == null || !intent.hasExtra("serviceEntrypoint")) {{
             intent = getThisDefaultIntent(getApplicationContext(), "");
         }} else {{
-            // Ensure title and description are present even if launched normally via Python without them
             if (!intent.hasExtra("serviceTitle")) {{
                 intent.putExtra("serviceTitle", "{title}");
             }}
@@ -1818,23 +1117,18 @@ public class {service_name} extends PythonService {{
         }}
         {foreground_logic}
         setAutoRestartService({is_sticky_bool_str});
-        
+
         return super.onStartCommand(intent, flags, startId);
     }}
 
-    // ====================================================================
-    // BACKWARD COMPATIBILITY: Legacy p4a bootstrap helpers for Pyjnius
-    // ====================================================================
-
-    /** * Handles old python calls like: service_class.start(mActivity, "")
-     */
+    /** Start with the generated notification defaults. */
     public static void start(Context ctx, String pythonServiceArgument) {{
         start(ctx, "{notification_icon}", "{title}", "{text}", pythonServiceArgument);
     }}
 
-    /** * Handles old python calls like: service_class.start(mActivity, "icon", "logger", "Connecting", "")
-     */
-    public static void start(Context ctx, String smallIconName, String contentTitle, String contentText, String pythonServiceArgument) {{
+    /** Start with a caller-supplied icon, title and text. */
+    public static void start(Context ctx, String smallIconName, String contentTitle,
+                             String contentText, String pythonServiceArgument) {{
         Intent intent = new Intent(ctx, {service_name}.class);
         intent.putExtra("androidPrivate", ctx.getFilesDir().getAbsolutePath());
         intent.putExtra("serviceEntrypoint", "{entrypoint}");
@@ -1844,7 +1138,7 @@ public class {service_name} extends PythonService {{
         intent.putExtra("serviceDescription", contentText);
         intent.putExtra("smallIconName", smallIconName);
         intent.putExtra("pythonServiceArgument", pythonServiceArgument);
-        intent.putExtra("serviceStartAsForeground", "{'true' if foreground else 'false'}");
+        intent.putExtra("serviceStartAsForeground", "{foreground_str}");
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {{
             ctx.startForegroundService(intent);
@@ -1853,449 +1147,9 @@ public class {service_name} extends PythonService {{
         }}
     }}
 
-    /**
-     * Handles old python calls like: service_class.stop(mActivity)
-     */
     public static void stop(Context ctx) {{
-        Intent intent = new Intent(ctx, {service_name}.class);
-        ctx.stopService(intent);
+        ctx.stopService(new Intent(ctx, {service_name}.class));
     }}
 }}
 """
         (java_dir / f"{service_name}.java").write_text(content, encoding="utf-8")
-
-    # -------------------------------------------------------------------------
-    # GenericBroadcastReceiver.java + GenericBroadcastReceiverCallback.java
-    # -------------------------------------------------------------------------
-    @staticmethod
-    def write_generic_broadcast_receiver(main_dir: Path) -> None:
-        """Writes the BroadcastReceiver that delegates to the Pyjnius callback."""
-        java_dir = main_dir / "java" / "org" / "kivy" / "android"
-        java_dir.mkdir(parents=True, exist_ok=True)
-
-        content = """\
-package org.kivy.android;
-
-import android.content.BroadcastReceiver;
-import android.content.Context;
-import android.content.Intent;
-
-public class GenericBroadcastReceiver extends BroadcastReceiver {
-
-    private GenericBroadcastReceiverCallback callback;
-
-    public GenericBroadcastReceiver(GenericBroadcastReceiverCallback callback) {
-        this.callback = callback;
-    }
-
-    @Override
-    public void onReceive(Context context, Intent intent) {
-        if (this.callback != null) {
-            this.callback.onReceive(context, intent);
-        }
-    }
-}
-"""
-        (java_dir / "GenericBroadcastReceiver.java").write_text(
-            content, encoding="utf-8"
-        )
-
-    @staticmethod
-    def write_generic_broadcast_receiver_callback(main_dir: Path) -> None:
-        """Writes the standalone callback interface required by Pyjnius/Plyer."""
-        java_dir = main_dir / "java" / "org" / "kivy" / "android"
-        java_dir.mkdir(parents=True, exist_ok=True)
-
-        content = """\
-package org.kivy.android;
-
-import android.content.Context;
-import android.content.Intent;
-
-public interface GenericBroadcastReceiverCallback {
-    void onReceive(Context context, Intent intent);
-}
-"""
-        (java_dir / "GenericBroadcastReceiverCallback.java").write_text(
-            content, encoding="utf-8"
-        )
-
-    # -------------------------------------------------------------------------
-    # Native bootstrap — libmain.so (provides SDL_main → CPython)
-    # -------------------------------------------------------------------------
-
-    @staticmethod
-    def write_main_c(cpp_dir: Path, python_version: str, project_name: str) -> None:
-        cpp_dir.mkdir(parents=True, exist_ok=True)
-        content = f"""\
-/* ksproject native bootstrap: SDL_main -> CPython
- * SDL_main.h #defines main as SDL_main; SDLActivity's native thread calls
- * SDL_main after System.loadLibrary("main"). We initialize CPython, set
- * up module search paths against the unpacked assets, then run main.py.
- */
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
-#include <SDL.h>
-#include <SDL_main.h>
-#include <android/log.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <wchar.h>
-
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "ksproject", __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "ksproject", __VA_ARGS__)
-
-static PyObject *androidembed_log(PyObject *self, PyObject *args) {{
-    const char *s;
-    if (!PyArg_ParseTuple(args, "s", &s)) return NULL;
-    __android_log_write(ANDROID_LOG_INFO, "python", s);
-    Py_RETURN_NONE;
-}}
-
-static PyMethodDef AndroidEmbedMethods[] = {{
-    {{"log", androidembed_log, METH_VARARGS, "log to android logcat"}},
-    {{NULL, NULL, 0, NULL}}
-}};
-
-static struct PyModuleDef androidembed_mod = {{
-    PyModuleDef_HEAD_INIT, "androidembed", NULL, -1, AndroidEmbedMethods
-}};
-
-PyMODINIT_FUNC PyInit_androidembed(void) {{
-    return PyModule_Create(&androidembed_mod);
-}}
-
-static const char *REDIRECT_STDIO =
-    "import sys, androidembed\\n"
-    "class _LogFile:\\n"
-    "    def __init__(self): self._buf = ''\\n"
-    "    def write(self, s):\\n"
-    "        self._buf += s\\n"
-    "        while chr(10) in self._buf:\\n"
-    "            i = self._buf.index(chr(10))\\n"
-    "            androidembed.log(self._buf[:i])\\n"
-    "            self._buf = self._buf[i+1:]\\n"
-    "    def flush(self):\\n"
-    "        if self._buf:\\n"
-    "            androidembed.log(self._buf); self._buf = ''\\n"
-    "sys.stdout = sys.stderr = _LogFile()\\n";
-
-int main(int argc, char *argv[]) {{
-    (void)argc; (void)argv;
-    LOGI("SDL_main entered");
-
-    const char *app_path = getenv("ANDROID_APP_PATH");
-    const char *entrypoint = getenv("ANDROID_ENTRYPOINT");
-    if (!app_path || !entrypoint) {{
-        LOGE("missing ANDROID_APP_PATH / ANDROID_ENTRYPOINT");
-        return 1;
-    }}
-
-    char done_path[1024];
-    snprintf(done_path, sizeof(done_path), "%s/.unpack_done", app_path);
-    while (access(done_path, F_OK) != 0) {{
-        usleep(50000); // Sleep for 50ms while presplash is displaying on the UI thread
-    }}
-    
-    /* Env vars untill we patch Kivy platform check*/
-    setenv("KIVY_NO_FILELOG", "1", 1);
-    setenv("KIVY_NO_CONFIG", "1", 1);
-    setenv("KIVY_BUILD", "android", 1);
-    if (app_path) {{
-        setenv("KIVY_HOME", app_path, 1);
-    }}
-
-    if (chdir(app_path) != 0) {{
-        LOGE("chdir(%s) failed", app_path);
-    }}
-
-    PyImport_AppendInittab("androidembed", PyInit_androidembed);
-
-    PyConfig config;
-    PyConfig_InitIsolatedConfig(&config);
-    config.parse_argv = 0;
-    config.install_signal_handlers = 0;
-    config.write_bytecode = 0;
-    config.use_environment = 1;
-
-    wchar_t w_stdlib[1024];
-    wchar_t w_dynload[1024];
-    wchar_t w_site[1024];
-    wchar_t w_project_site[1024];
-    wchar_t w_app[1024];
-    swprintf(w_stdlib,  1024, L"%s/python{python_version}", app_path);
-    swprintf(w_dynload, 1024, L"%s/python{python_version}/lib-dynload", app_path);
-    swprintf(w_site,    1024, L"%s/site-packages", app_path);
-    swprintf(w_project_site, 1024, L"%s/site-packages/{project_name}", app_path);
-    swprintf(w_app,     1024, L"%s", app_path);
-    config.module_search_paths_set = 1;
-    PyWideStringList_Append(&config.module_search_paths, w_stdlib);
-    PyWideStringList_Append(&config.module_search_paths, w_dynload);
-    PyWideStringList_Append(&config.module_search_paths, w_site);
-    PyWideStringList_Append(&config.module_search_paths, w_project_site);
-    PyWideStringList_Append(&config.module_search_paths, w_app);
-    const char *native_lib_dir = getenv("ANDROID_NATIVE_LIB_DIR");
-    if (native_lib_dir) {{
-        wchar_t w_native[1024];
-        swprintf(w_native, 1024, L"%s", native_lib_dir);
-        PyWideStringList_Append(&config.module_search_paths, w_native);
-    }}
-
-    PyStatus status = Py_InitializeFromConfig(&config);
-    PyConfig_Clear(&config);
-    if (PyStatus_Exception(status)) {{
-        LOGE("Py_InitializeFromConfig failed: %s",
-             status.err_msg ? status.err_msg : "(no message)");
-        return 1;
-    }}
-    LOGI("Python initialized");
-
-    PyRun_SimpleString(REDIRECT_STDIO);
-    
-    /* Run `python -m <entrypoint>` via runpy. The entrypoint env var is the
-     * importable package or module name, not a filesystem path. */
-    PyObject *runpy = PyImport_ImportModule("runpy");
-    if (!runpy) {{
-        LOGE("import runpy failed");
-        if (PyErr_Occurred()) PyErr_Print();
-        Py_FinalizeEx();
-        return 1;
-    }}
-    PyObject *func = PyObject_GetAttrString(runpy, "run_module");
-    if (!func) {{
-        LOGE("runpy has no run_module");
-        Py_DECREF(runpy);
-        Py_FinalizeEx();
-        return 1;
-    }}
-    PyObject *args_tuple = PyTuple_Pack(1, PyUnicode_FromString(entrypoint));
-    PyObject *kwargs = Py_BuildValue("{{s:s, s:i}}",
-                                     "run_name", "__main__",
-                                     "alter_sys", 1);
-    LOGI("running module: %s", entrypoint);
-    PyObject *result = PyObject_Call(func, args_tuple, kwargs);
-    Py_DECREF(args_tuple);
-    Py_DECREF(kwargs);
-    Py_DECREF(func);
-    Py_DECREF(runpy);
-
-    int ret = 0;
-    if (!result) {{
-        LOGE("python entrypoint raised");
-        PyErr_Print();
-        ret = 1;
-    }} else {{
-        Py_DECREF(result);
-    }}
-
-    Py_FinalizeEx();
-    LOGI("python exit %d", ret);
-    exit(ret);
-    return ret;
-}}
-"""
-        (cpp_dir / "main.c").write_text(content, encoding="utf-8")
-
-    # -------------------------------------------------------------------------
-    # Native bootstrap — libservicemain.so
-    # -------------------------------------------------------------------------
-
-    @staticmethod
-    def write_service_main_c(cpp_dir: Path, project_name: str) -> None:
-        cpp_dir.mkdir(parents=True, exist_ok=True)
-        content = f"""\
-#define PY_SSIZE_T_CLEAN
-#include <jni.h>
-#include <Python.h>
-#include <android/log.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "ksproject-service", __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "ksproject-service", __VA_ARGS__)
-
-// Include the same AndroidEmbed implementation as main.c
-static PyObject *androidembed_log(PyObject *self, PyObject *args) {{
-    const char *s;
-    if (!PyArg_ParseTuple(args, "s", &s)) return NULL;
-    __android_log_write(ANDROID_LOG_INFO, "python-service", s);
-    Py_RETURN_NONE;
-}}
-
-static PyMethodDef AndroidEmbedMethods[] = {{
-    {{"log", androidembed_log, METH_VARARGS, "log to android logcat"}},
-    {{NULL, NULL, 0, NULL}}
-}};
-
-static struct PyModuleDef androidembed_mod = {{
-    PyModuleDef_HEAD_INIT, "androidembed", NULL, -1, AndroidEmbedMethods
-}};
-
-PyMODINIT_FUNC PyInit_androidembed(void) {{
-    return PyModule_Create(&androidembed_mod);
-}}
-
-static const char *REDIRECT_STDIO =
-    "import sys, androidembed\\n"
-    "class _LogFile:\\n"
-    "    def __init__(self): self._buf = ''\\n"
-    "    def write(self, s):\\n"
-    "        self._buf += s\\n"
-    "        while chr(10) in self._buf:\\n"
-    "            i = self._buf.index(chr(10))\\n"
-    "            androidembed.log(self._buf[:i])\\n"
-    "            self._buf = self._buf[i+1:]\\n"
-    "    def flush(self):\\n"
-    "        if self._buf:\\n"
-    "            androidembed.log(self._buf); self._buf = ''\\n"
-    "sys.stdout = sys.stderr = _LogFile()\\n";
-
-JNIEXPORT jint JNICALL
-Java_org_kivy_android_PythonService_nativeStart(
-    JNIEnv *env, jobject thiz, jstring j_androidPrivate, jstring j_entrypoint, jstring j_pyVersion) {{
-
-    const char *private_path = (*env)->GetStringUTFChars(env, j_androidPrivate, NULL);
-    const char *entrypoint = (*env)->GetStringUTFChars(env, j_entrypoint, NULL);
-    const char *py_version = (*env)->GetStringUTFChars(env, j_pyVersion, NULL);
-
-    char app_path[1024];
-    snprintf(app_path, sizeof(app_path), "%s/app", private_path);
-
-    LOGI("Service starting. App Path: %s, Entry: %s", app_path, entrypoint);
-
-    char done_path[1024];
-    snprintf(done_path, sizeof(done_path), "%s/.unpack_done", app_path);
-    while (access(done_path, F_OK) != 0) {{
-        usleep(50000); // Sleep for 50ms while presplash is displaying on the UI thread
-    }}
-
-    if (chdir(app_path) != 0) {{
-        LOGE("chdir(%s) failed", app_path);
-    }}
-
-    setenv("ANDROID_APP_PATH", app_path, 1);
-    setenv("ANDROID_ENTRYPOINT", entrypoint, 1);
-    setenv("ANDROID_ARGUMENT", app_path, 1);
-    setenv("ANDROID_PRIVATE", private_path, 1);
-    setenv("ANDROID_UNPACK", app_path, 1);
-
-    setenv("PYTHONHOME", app_path, 1);
-    setenv("PYTHONNOUSERSITE", "1", 1);
-    setenv("PYTHONUNBUFFERED", "1", 1);
-    setenv("PYTHONOPTIMIZE", "2", 1);
-    setenv("PYTHON_SERVICE_ARGUMENT", entrypoint, 1);
-
-    // just to make sure no abnormalities
-    setenv("KIVY_NO_FILELOG", "1", 1);
-    setenv("KIVY_NO_CONFIG", "1", 1);
-    setenv("KIVY_BUILD", "android", 1);
-    setenv("KIVY_HOME", app_path, 1);
-
-    PyImport_AppendInittab("androidembed", PyInit_androidembed);
-
-    PyConfig config;
-    PyConfig_InitIsolatedConfig(&config);
-    config.parse_argv = 0;
-    config.install_signal_handlers = 0;
-    config.write_bytecode = 0;
-    config.use_environment = 1;
-
-    // Build paths
-    wchar_t w_stdlib[1024], w_dynload[1024], w_site[1024], w_project_site[1024], w_app[1024];
-    swprintf(w_stdlib,  1024, L"%s/python%s", app_path, py_version);
-    swprintf(w_dynload, 1024, L"%s/python%s/lib-dynload", app_path, py_version);
-    swprintf(w_site,    1024, L"%s/site-packages", app_path);
-
-    swprintf(w_project_site, 1024, L"%s/site-packages/{project_name}", app_path);
-    swprintf(w_app,     1024, L"%s", app_path);
-
-    config.module_search_paths_set = 1;
-    PyWideStringList_Append(&config.module_search_paths, w_stdlib);
-    PyWideStringList_Append(&config.module_search_paths, w_dynload);
-    PyWideStringList_Append(&config.module_search_paths, w_site);
-    PyWideStringList_Append(&config.module_search_paths, w_project_site);
-    PyWideStringList_Append(&config.module_search_paths, w_app);
-
-    const char *native_lib_dir = getenv("ANDROID_NATIVE_LIB_DIR");
-    if (native_lib_dir) {{
-        wchar_t w_native[1024];
-        swprintf(w_native, 1024, L"%s", native_lib_dir);
-        PyWideStringList_Append(&config.module_search_paths, w_native);
-    }}
-
-    PyStatus status = Py_InitializeFromConfig(&config);
-    PyConfig_Clear(&config);
-    if (PyStatus_Exception(status)) {{
-        LOGE("Service Py_Initialize failed");
-        return 1;
-    }}
-
-    PyRun_SimpleString(REDIRECT_STDIO);
-
-    PyObject *runpy = PyImport_ImportModule("runpy");
-    PyObject *func = PyObject_GetAttrString(runpy, "run_module");
-    PyObject *args_tuple = PyTuple_Pack(1, PyUnicode_FromString(entrypoint));
-
-    PyObject *kwargs = Py_BuildValue("{{s:s, s:i}}", "run_name", "__main__", "alter_sys", 1);
-
-    PyObject *result = PyObject_Call(func, args_tuple, kwargs);
-
-    int ret = 0;
-    if (!result) {{
-        LOGE("python service entrypoint raised an exception");
-        PyErr_Print();
-        ret = 1;
-    }} else {{
-        Py_DECREF(result);
-    }}
-
-    Py_FinalizeEx();
-
-    (*env)->ReleaseStringUTFChars(env, j_androidPrivate, private_path);
-    (*env)->ReleaseStringUTFChars(env, j_entrypoint, entrypoint);
-    (*env)->ReleaseStringUTFChars(env, j_pyVersion, py_version);
-
-    LOGI("Service python thread exit");
-    return ret;
-}}
-"""
-        (cpp_dir / "service_main.c").write_text(content, encoding="utf-8")
-
-    @staticmethod
-    def write_cmake_lists(cpp_dir: Path) -> None:
-        cpp_dir.mkdir(parents=True, exist_ok=True)
-        content = """\
-cmake_minimum_required(VERSION 3.22)
-project(ksproject_main C)
-
-set(CMAKE_C_STANDARD 11)
-
-# SDL2 headers extracted from the SDL2 source tarball.
-set(SDL2_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/sdl2_include")
-
-# Python headers — per-ABI (each arch has its own pyconfig.h).
-set(PYTHON_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/python_include/${ANDROID_ABI}")
-
-# Pre-built shared libs live in jniLibs/<abi>/ alongside this build.
-set(JNI_LIBS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}")
-
-add_library(SDL2 SHARED IMPORTED)
-set_target_properties(SDL2 PROPERTIES IMPORTED_LOCATION "${JNI_LIBS_DIR}/libSDL2.so")
-
-add_library(python3 SHARED IMPORTED)
-set_target_properties(python3 PROPERTIES IMPORTED_LOCATION "${JNI_LIBS_DIR}/libpython3.so")
-
-# Primary UI Bootstrap
-add_library(main SHARED main.c)
-target_include_directories(main PRIVATE "${SDL2_INCLUDE_DIR}" "${PYTHON_INCLUDE_DIR}")
-target_link_libraries(main SDL2 python3 log android)
-
-# Background Service Bootstrap
-add_library(service_main SHARED service_main.c)
-target_include_directories(service_main PRIVATE "${PYTHON_INCLUDE_DIR}")
-target_link_libraries(service_main python3 log android)
-"""
-        (cpp_dir / "CMakeLists.txt").write_text(content, encoding="utf-8")
