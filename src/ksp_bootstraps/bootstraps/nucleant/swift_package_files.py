@@ -324,6 +324,70 @@ func nucleantLog(_ message: String) {
     NSLog("[nucleant] \\(message)")
 }
 
+/// `__android_log_write` reached through dlsym, the same way the rest of the
+/// file reaches host hooks — liblog is always loaded in an app process, and
+/// this avoids adding a header and a `link` to the C shim for one function.
+private let androidLogWrite: (@convention(c) (Int32, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Int32)? = {
+    guard
+        let handle = dlopen("liblog.so", RTLD_NOW),
+        let sym = dlsym(handle, "__android_log_write")
+    else { return nil }
+    return unsafeBitCast(
+        sym,
+        to: (@convention(c) (Int32, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Int32).self
+    )
+}()
+
+/// Straight to logcat, never through NSLog.  This is called from the thread
+/// draining the redirected fds, and on Android NSLog itself writes to stderr —
+/// which is one end of that pipe, so using it here would feed every line back
+/// into the reader and spin forever.
+private func nucleantLogRaw(_ line: String) {
+    line.withCString { text in
+        "python".withCString { tag in
+            _ = androidLogWrite?(6 /* ANDROID_LOG_ERROR */, tag, text)
+        }
+    }
+}
+
+/// fd-level backstop for `redirectStdio()`.  That one rebinds `sys.stdout` /
+/// `sys.stderr`, so it only catches writes that go through those objects and
+/// only once the interpreter is up — it misses `PyErr_Print()` before
+/// `redirectStdio()` runs, faulthandler, and anything a C extension writes to
+/// fd 2 directly.  Those are exactly the writes that carry a startup
+/// traceback, so both fds are rebound here to a pipe drained by a thread that
+/// forwards each line to logcat.
+func nucleantRedirectFDs() {
+    var fds: [Int32] = [0, 0]
+    guard pipe(&fds) == 0 else {
+        nucleantLog("ERROR: pipe() failed — stdout/stderr not captured")
+        return
+    }
+    dup2(fds[1], STDOUT_FILENO)
+    dup2(fds[1], STDERR_FILENO)
+    close(fds[1])
+    setvbuf(stdout, nil, _IOLBF, 0)
+    setvbuf(stderr, nil, _IONBF, 0)
+
+    let readFD = fds[0]
+    let reader = Thread {
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        var pending = ""
+        while true {
+            let n = read(readFD, &chunk, chunk.count)
+            if n <= 0 { break }
+            pending += String(decoding: chunk[0..<n], as: UTF8.self)
+            while let nl = pending.firstIndex(of: "\\n") {
+                nucleantLogRaw(String(pending[pending.startIndex..<nl]))
+                pending = String(pending[pending.index(after: nl)...])
+            }
+        }
+        if !pending.isEmpty { nucleantLogRaw(pending) }
+    }
+    reader.stackSize = 512 * 1024
+    reader.start()
+}
+
 struct LaunchError: Error, CustomStringConvertible {
     let description: String
     init(_ description: String) { self.description = description }
@@ -424,6 +488,7 @@ final class NucleantLauncher {
     }
 
     func preLaunch(_ on_pre_launch: () -> Void) throws {
+        nucleantRedirectFDs()
         androidSettings()
         awaitUnpack()
         if chdir(appPath) != 0 {
@@ -646,6 +711,10 @@ import sys
 _ANDROID_LOG_INFO = 4
 _ANDROID_LOG_ERROR = 6
 _liblog = ctypes.CDLL('liblog.so')
+# getattr, not attribute access: inside a class body Python mangles any
+# identifier starting with two underscores, so `_liblog.__android_log_write`
+# becomes a lookup for `_LogcatStream__android_log_write` and always fails.
+_log_write = getattr(_liblog, '__android_log_write')
 
 
 class _LogcatStream:
@@ -657,14 +726,14 @@ class _LogcatStream:
         self._buffer += text
         while '\\\\n' in self._buffer:
             line, _, self._buffer = self._buffer.partition('\\\\n')
-            _liblog.__android_log_write(
+            _log_write(
                 self._priority, b'python', line.encode('utf-8', 'replace')
             )
         return len(text)
 
     def flush(self):
         if self._buffer:
-            _liblog.__android_log_write(
+            _log_write(
                 self._priority, b'python', self._buffer.encode('utf-8', 'replace')
             )
             self._buffer = ''
@@ -857,6 +926,9 @@ private enum TouchPhase: Int32 {
 /// miss, so a wheel that exports only some of the hooks does not pay for a
 /// failed dlsym on every touch event.
 private nonisolated(unsafe) var symbolCache: [String: UnsafeMutableRawPointer?] = [:]
+/// dlopen handle for the renderer library, once it has announced itself.
+/// Guarded by `symbolLock` along with the cache.
+private nonisolated(unsafe) var rendererHandle: UnsafeMutableRawPointer?
 private let symbolLock = NSLock()
 
 private func hostSymbol<T>(_ name: String, as type: T.Type) -> T? {
@@ -873,7 +945,21 @@ private func hostSymbol<T>(_ name: String, as type: T.Type) -> T? {
     if let cached {
         raw = cached
     } else {
-        raw = dlsym(UnsafeMutableRawPointer(bitPattern: 0), name)  // RTLD_DEFAULT
+        // The renderer's handle before RTLD_DEFAULT, because RTLD_DEFAULT
+        // cannot reach it: it searches the global group, and _nucleant.so is
+        // dlopened by Python into its own linker namespace. The handle only
+        // exists once the renderer has announced itself — see
+        // nucleantRefreshHostHooks(_:).
+        symbolLock.lock()
+        let handle = rendererHandle
+        symbolLock.unlock()
+
+        var found = handle.flatMap { dlsym($0, name) }
+        if found == nil {
+            found = dlsym(UnsafeMutableRawPointer(bitPattern: 0), name)  // RTLD_DEFAULT
+        }
+        raw = found
+
         symbolLock.lock()
         symbolCache[name] = raw
         symbolLock.unlock()
@@ -888,9 +974,30 @@ private func hostSymbol<T>(_ name: String, as type: T.Type) -> T? {
 /// Drops every cached lookup. Call after loading a library that exports the
 /// hooks if any event was already dispatched before it arrived — otherwise the
 /// cached misses persist for the life of the process.
-public func nucleantRefreshHostHooks() {
+///
+/// `@_cdecl` because the caller is the renderer, reaching back the same way
+/// this file reaches it. Only the renderer knows when its own library finished
+/// loading, and a mangled Swift symbol would make that lookup depend on this
+/// module's name and signature.
+///
+/// `rendererPath` is that library's own filesystem path, which it can get from
+/// `dladdr` on any of its own symbols. It is required rather than optional in
+/// practice: `_nucleant.so` lives under site-packages, off the linker's search
+/// path and in the namespace Python dlopened it into, so neither RTLD_DEFAULT
+/// nor a dlopen by bare name can find it. Passing nil keeps the old
+/// RTLD_DEFAULT-only behaviour.
+@_cdecl("nucleant_refresh_host_hooks")
+public func nucleantRefreshHostHooks(_ rendererPath: UnsafePointer<CChar>?) {
     symbolLock.lock()
     symbolCache.removeAll()
+    if let rendererPath, rendererHandle == nil {
+        // Already loaded, so this returns the existing handle rather than
+        // mapping a second copy — it is the handle we are after, not the load.
+        rendererHandle = dlopen(rendererPath, RTLD_NOW)
+        if rendererHandle == nil {
+            NSLog("[nucleant] could not open renderer at \\(String(cString: rendererPath))")
+        }
+    }
     symbolLock.unlock()
 
     // Replay the current surface: the renderer missed the original callback if
@@ -955,6 +1062,32 @@ public func nucleantAcquireWindow() -> OpaquePointer? {
 public func nucleantReleaseWindow(_ window: OpaquePointer?) {
     guard let window else { return }
     ANativeWindow_release(window)
+}
+
+// MARK: - First frame
+
+/// Set by the renderer once it has presented a frame, read by the Activity so
+/// it knows when to take the presplash down.
+///
+/// A flag polled from Java rather than a call up into Java: jextract generates
+/// the Java -> Swift direction only, and reaching the Activity from the render
+/// thread would mean a global ref plus AttachCurrentThread by hand. The
+/// Activity is already on a looper, so letting it ask is far less machinery.
+private nonisolated(unsafe) var firstFrameRendered = false
+private let firstFrameLock = NSLock()
+
+@_cdecl("nucleant_android_first_frame")
+public func nucleantAndroidFirstFrame() {
+    firstFrameLock.lock()
+    firstFrameRendered = true
+    firstFrameLock.unlock()
+}
+
+/// Whether a frame has reached the surface. Java-facing.
+public func nucleantFirstFrameRendered() -> Bool {
+    firstFrameLock.lock()
+    defer { firstFrameLock.unlock() }
+    return firstFrameRendered
 }
 
 // MARK: - Java-facing lifecycle

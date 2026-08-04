@@ -59,6 +59,9 @@ _SWIFT_RUNTIME_LIBS = [
     "BlocksRuntime",
     "swiftSwiftOnoneSupport",
     "swiftDispatch",
+    # @Observable — the whole Swift graph uses Observation, so every app links
+    # it whether or not its own code names it.
+    "swiftObservation",
     "Foundation",
     "FoundationEssentials",
     "FoundationInternationalization",
@@ -77,7 +80,7 @@ class GradleBuildError(Exception):
 # copy is replaced and the old one kept beside it. Bump these whenever the
 # corresponding default template changes in a way an app needs.
 _TEMPLATE_VERSION_MARKER = "ksproject-template:"
-_BUILD_GRADLE_TEMPLATE_VERSION = 2
+_BUILD_GRADLE_TEMPLATE_VERSION = 5
 _MANIFEST_TEMPLATE_VERSION = 2
 
 
@@ -244,6 +247,7 @@ include(":app")
         post_build: Path | None = None,
         byte_compile_default: bool = False,
         uv_python: str | None = None,
+        app_module: str = "",
     ) -> None:
 
         arch_values = [a.value for a in archs]
@@ -283,14 +287,14 @@ include(":app")
         swift_config = GradleBuildFiles._swift_runtime_config()
         build_tasks = GradleBuildFiles._swift_runtime_tasks(arch_values)
         build_tasks += GradleBuildFiles._site_packages_tasks(
-            arch_list_kts, python_version, byte_compile_default, uv_python
+            arch_list_kts, python_version, byte_compile_default, uv_python, app_module
         )
         build_tasks += GradleBuildFiles._post_build_task(post_build)
 
         template_path = project_dir / "build.tmpl.gradle.kts"
 
         default_template = """\
-// ksproject-template: 2 — do not remove; the generator replaces this file when
+// ksproject-template: 5 — do not remove; the generator replaces this file when
 // its own default is newer, keeping your copy as build.tmpl.gradle.kts.vN.bak.
 plugins {
     id("{{ plugin_id }}")
@@ -599,6 +603,7 @@ tasks.configureEach {{
         python_version: str,
         byte_compile_default: bool,
         uv_python: str | None = None,
+        app_module: str = "",
     ) -> str:
         kt_bool = str(byte_compile_default).lower()
         # Byte-compile with a uv-managed interpreter pinned to the bundled
@@ -615,6 +620,14 @@ abstract class OptimizePythonTask : DefaultTask() {{
 
     @get:Input
     abstract val ndkDir: Property<String>
+
+    // The app's own top-level package. junkDirs below is a size heuristic aimed
+    // at dependencies, and it matches on bare directory name anywhere in the
+    // tree — so an app package with an `examples/` (or `tests/`, `bin/`, ...)
+    // subpackage would have its own source deleted and fail at import. Nothing
+    // under this directory is ever "junk".
+    @get:Input
+    abstract val protectedPackage: Property<String>
 
     @TaskAction
     fun runOptimization() {{
@@ -645,9 +658,19 @@ abstract class OptimizePythonTask : DefaultTask() {{
             }}
         }}
 
+        // Matched on ancestry rather than a fixed root: this task's directory is
+        // the staging root, and the app package sits under
+        // site-packages/<abi>/ inside it, not directly beneath.
+        val protectedName = protectedPackage.get()
+
         allFiles.forEach {{ f ->
             if (f.isDirectory && junkDirs.contains(f.name) && f.exists()) {{
-                f.deleteRecursively()
+                val isAppOwn = protectedName.isNotEmpty() &&
+                    generateSequence(f.parentFile) {{ it.parentFile }}
+                        .any {{ it.name == protectedName }}
+                if (!isAppOwn) {{
+                    f.deleteRecursively()
+                }}
             }}
         }}
 
@@ -708,6 +731,7 @@ val optimizeStagedTasks = sitePackagesAbis.map {{ abi ->
         shouldCompile.set(isReleaseBuild || isCmdLineForced || {kt_bool})
         targetPath.set(stagingDir.absolutePath)
         ndkDir.set(androidExt.ndkDirectory.absolutePath)
+        protectedPackage.set("{app_module}")
     }}
 }}
 

@@ -145,6 +145,7 @@ class NucleantGradleBuilder:
                 self.android.byte_compile_python if self.android else True
             ),
             uv_python=getattr(delegate, "uv_py_version", None),
+            app_module=_module_name(self.pyproject.project.name),
         )
 
         _install_bootstrap_aar(app_dir)
