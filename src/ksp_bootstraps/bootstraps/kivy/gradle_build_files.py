@@ -360,10 +360,19 @@ abstract class OptimizePythonTask : DefaultTask() {{
         val doCompile = shouldCompile.get()
 
         if (doCompile) {{
-            ProcessBuilder("uv", "run", "--no-project", "--python", "{uv_py}", "python", "-m", "compileall", "-b", "-o", "2", "-j", "0", "-q", path)
+            val compileProcess = ProcessBuilder("uv", "run", "--no-project", "--python", "{uv_py}", "python", "-m", "compileall", "-b", "-o", "2", "-j", "0", "-q", path)
                 .redirectErrorStream(true)
                 .start()
-                .waitFor()
+            val compileOutput = compileProcess.inputStream.bufferedReader().readText()
+            val compileExitCode = compileProcess.waitFor()
+            if (compileOutput.isNotBlank()) {{
+                println(compileOutput)
+            }}
+            if (compileExitCode != 0) {{
+                throw GradleException(
+                    "Python bytecode compilation failed with exit code $compileExitCode"
+                )
+            }}
         }}
 
         val junkExts = mutableListOf(".pyi", ".c", ".cpp", ".h", ".pyx", ".pxd", ".md", ".rst")
