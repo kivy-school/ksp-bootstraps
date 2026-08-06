@@ -81,7 +81,7 @@ class GradleBuildError(Exception):
 # corresponding default template changes in a way an app needs.
 _TEMPLATE_VERSION_MARKER = "ksproject-template:"
 _BUILD_GRADLE_TEMPLATE_VERSION = 5
-_MANIFEST_TEMPLATE_VERSION = 2
+_MANIFEST_TEMPLATE_VERSION = 3
 
 
 def _template_version(text: str) -> int:
@@ -863,7 +863,7 @@ tasks.configureEach {{
 
         default_template = """\
 <?xml version="1.0" encoding="utf-8"?>
-<!-- ksproject-template: 2 — do not remove; the generator replaces this file when
+<!-- ksproject-template: 3 — do not remove; the generator replaces this file when
      its own default is newer, keeping your copy as AndroidManifest.tmpl.xml.vN.bak. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -886,6 +886,7 @@ tasks.configureEach {{
         <activity
             android:name=".MainActivity"
             android:label="{{ app_name }}"
+            android:launchMode="singleTask"
             android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|fontScale|uiMode|screenSize|smallestScreenSize|layoutDirection|density|colorMode|fontWeightAdjustment|grammaticalGender"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
             android:exported="true">{{ activity_meta_data }}
