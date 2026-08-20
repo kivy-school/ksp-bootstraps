@@ -16,7 +16,7 @@ from enum import StrEnum
 from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
 from ...pyproject_models.pyproject_toml import KivySchoolProtocol, AndroidProtocol
 
-#Arch = AndroidProtocol.Arch
+# Arch = AndroidProtocol.Arch
 
 _GRADLE_VERSION = "9.5.0"
 # Gradle commits the wrapper jar to their own repo; download it directly so
@@ -407,48 +407,45 @@ val stagingDir = layout.buildDirectory.dir("python_assets_staging").get().asFile
 val assetsDir = layout.projectDirectory.dir("src/main/assets")
 val generatedAssetsDir = layout.buildDirectory.dir("generated/python_assets").get().asFile
 
-val stagePythonTasks = sitePackagesAbis.map {{ abi ->
-    tasks.register<Copy>("stagePython_${{abi}}") {{
-        group = "python"
+val stagePython = tasks.register<Copy>("stagePython") {{
+    group = "python"
 
+    from(assetsDir.dir("python{python_version}")) {{
+        into("python{python_version}")
+    }}
+    from(assetsDir.dir("lib-dynload")) {{
+        into("lib-dynload")
+    }}
+
+    sitePackagesAbis.forEach {{ abi ->
         val sitePackDir = layout.projectDirectory.dir("../site_packages/$abi")
         from(sitePackDir) {{
             exclude(".libs/**", ".java/**", ".kotlin/**", ".gradle/**")
             into("site-packages/$abi")
         }}
-
-        from(assetsDir.dir("python{python_version}")) {{
-            into("python{python_version}")
-        }}
-
-        from(assetsDir.dir("lib-dynload")) {{
-            into("lib-dynload")
-        }}
-
-        into(stagingDir)
     }}
+
+    into(stagingDir)
 }}
 
-val optimizeStagedTasks = sitePackagesAbis.map {{ abi ->
-    tasks.register<OptimizePythonTask>("optimizeStaged_${{abi}}") {{
-        group = "python"
-        dependsOn("stagePython_${{abi}}")
+val optimizeStaged = tasks.register<OptimizePythonTask>("optimizeStaged") {{
+    group = "python"
+    dependsOn(stagePython)
 
-        val isCmdLineForced = project.hasProperty("forceCompile")
-        val isReleaseBuild = gradle.startParameter.taskNames.any {{ 
-            it.contains("Release", ignoreCase = true) 
-        }}
-        val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
-
-        shouldCompile.set(isReleaseBuild || isCmdLineForced || {kt_bool})
-        targetPath.set(stagingDir.absolutePath)
-        ndkDir.set(androidExt.ndkDirectory.absolutePath)
+    val isCmdLineForced = project.hasProperty("forceCompile")
+    val isReleaseBuild = gradle.startParameter.taskNames.any {{ 
+        it.contains("Release", ignoreCase = true) 
     }}
+    val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
+
+    shouldCompile.set(isReleaseBuild || isCmdLineForced || {kt_bool})
+    targetPath.set(stagingDir.absolutePath)
+    ndkDir.set(androidExt.ndkDirectory.absolutePath)
 }}
 
 val zipPythonAssets = tasks.register<Zip>("zipPythonAssets") {{
     group = "python"
-    dependsOn(optimizeStagedTasks)
+    dependsOn(optimizeStaged)
 
     archiveFileName.set("assets.zip")
     destinationDirectory.set(generatedAssetsDir)
