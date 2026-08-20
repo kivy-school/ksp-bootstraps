@@ -16,7 +16,7 @@ from enum import StrEnum
 from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
 from ...pyproject_models.pyproject_toml import KivySchoolProtocol, AndroidProtocol
 
-#Arch = AndroidProtocol.Arch
+# Arch = AndroidProtocol.Arch
 
 _GRADLE_VERSION = "9.5.0"
 # Gradle commits the wrapper jar to their own repo; download it directly so
@@ -62,7 +62,7 @@ pluginManagement {{
 }}
 
 dependencyResolutionManagement {{
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositoriesMode.set(RepositoriesMode.PREFER_PROJECT)
     repositories {{
         google()
         mavenCentral()
