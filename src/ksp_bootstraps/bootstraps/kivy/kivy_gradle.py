@@ -154,7 +154,8 @@ class KivyGradleBuilder:
             version_name=v_name,
             post_build=(self.android.post_build if self.android else None),
             byte_compile_default=(self.android.byte_compile_python if self.android else True),
-            uv_python=getattr(delegate, "uv_py_version", None)
+            uv_python=getattr(delegate, "uv_py_version", None),
+            universal_apk=(self.android.universal_apk if self.android else True)
         )
 
         main_dir = app_dir / "src" / "main"
