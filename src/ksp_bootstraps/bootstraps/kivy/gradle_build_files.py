@@ -15,6 +15,8 @@ from enum import StrEnum
 # from ksproject_utils.gradle.android_toolchain import DEFAULT_API_VERSION
 from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
 from ...pyproject_models.pyproject_toml import KivySchoolProtocol, AndroidProtocol
+from ksp_bootstraps.gradle.build_gradle_template import BUILD_GRADLE
+from ksp_bootstraps.gradle.android_manifest_template import ANDROID_MANIFEST
 
 # Arch = AndroidProtocol.Arch
 
@@ -147,117 +149,69 @@ include(":app")
         post_build: Path | None = None,
         byte_compile_default: bool = False,
         uv_python: str | None = None,
+        universal_apk: bool = True,
     ) -> None:
-
         abi_filters = ", ".join(f'"{a.value}"' for a in archs)
         arch_list_kts = ", ".join(f'"{a.value}"' for a in archs)
         ndk_line = f'    ndkVersion = "{ndk_version}"\n' if ndk_version else ""
         plugin_id = "com.android.library" if aar else "com.android.application"
 
         app_id_lines = (
-            ""
-            if aar
-            else f'        applicationId = "{package_name}"\n'
+            "" if aar else f'        applicationId = "{package_name}"\n'
             f"        versionCode = {version_code}\n"
             f'        versionName = "{version_name}"\n'
         )
 
-        extra_deps = "".join(
-            f'    implementation("{dep}")\n' for dep in (gradle_dependencies or [])
-        )
+        if universal_apk:
+            ndk_abi_block = f"""
+        ndk {{
+            abiFilters += setOf({abi_filters})
+        }}"""
+            flavor_block = ""
+            source_sets_block = """
+    sourceSets {
+        getByName("main") {
+            assets.srcDir(layout.buildDirectory.dir("generated/python_assets/universal").get().asFile)
+        }
+    }"""
+        else:
+            ndk_abi_block = ""
+            flavors = []
+            source_sets = []
+            
+            for a in archs:
+                flavor_name = a.value.replace("-", "_")
+                flavors.append(f"""
+        create("{flavor_name}") {{
+            dimension = "abi"
+            ndk {{ abiFilters += setOf("{a.value}") }}
+        }}""")
+                source_sets.append(f"""
+        getByName("{flavor_name}") {{
+            assets.srcDir(layout.buildDirectory.dir("generated/python_assets/{a.value}").get().asFile)
+        }}""")
 
+            flavor_block = f"""
+    flavorDimensions += listOf("abi")
+    productFlavors {{{"".join(flavors)}
+    }}"""
+            source_sets_block = f"""
+    sourceSets {{{"".join(source_sets)}
+    }}"""
+
+        extra_deps = "".join(f'    implementation("{dep}")\n' for dep in (gradle_dependencies or []))
         ndk_path_str = str(ndk_path).replace("\\", "/") if ndk_path else ""
+
         site_packages_tasks = GradleBuildFiles._site_packages_tasks(
-            arch_list_kts, python_version, byte_compile_default, uv_python
+            arch_list_kts, python_version, byte_compile_default, uv_python, universal_apk
         )
         site_packages_tasks += GradleBuildFiles._post_build_task(post_build)
 
         template_path = project_dir / "build.tmpl.gradle.kts"
 
         if not template_path.exists():
-            print(
-                "build.tmpl.gradle.kts not found... Continuing with default template..."
-            )
-            default_template = """\
-plugins {
-    id("{{ plugin_id }}")
-}
-
-android {
-    namespace = "{{ package_name }}"
-    compileSdk = {{ compile_sdk }}
-{{ ndk_line }}    ndkPath = "{{ ndk_path }}"
-
-    defaultConfig {
-{{ app_id_lines }}        minSdk = {{ min_sdk }}
-        targetSdk = {{ target_sdk }}
-
-        ndk {
-            abiFilters += setOf({{ abi_filters }})
-        }
-
-        externalNativeBuild {
-            cmake {
-                arguments += listOf("-DANDROID_STL=c++_static")
-            }
-        }
-    }
-
-    packaging {
-        jniLibs {
-            useLegacyPackaging = true
-            // excludes += setOf(
-            //     "**/libcrypto.so",
-            //     "**/libssl.so",
-            //     "**/libsqlite3.so"
-            // )
-        }
-    }
-
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
-        }
-    }
-
-    buildTypes {
-        release {
-            isMinifyEnabled = false
-        }
-    }
-
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
-    }
-
-    sourceSets {
-        getByName("main") {
-            assets.srcDir(layout.buildDirectory.dir("generated/python_assets").get().asFile)
-        }
-    }
-
-    // CPython stdlib and packages contain underscore-prefixed directories
-    // (e.g. zipfile/_path) that AGP's default aapt ignore pattern strips.
-    // Override to keep them.
-    androidResources {
-        ignoreAssetsPatterns.clear()
-        ignoreAssetsPatterns.addAll(listOf(
-            "!.svn", "!.git", "!.ds_store", "!*.scc",
-            "!CVS", "!thumbs.db", "!picasa.ini", "!*~",
-            "python*", "lib-dynload", "site-packages"
-        ))
-    }
-}
-
-dependencies {
-    implementation(fileTree("libs") { include("*.aar", "*.jar") })
-{{ extra_deps }}
-}
-
-{{ site_packages_tasks }}
-"""
+            print("build.tmpl.gradle.kts not found... Continuing with default template...")
+            default_template = BUILD_GRADLE
             template_path.write_text(default_template, encoding="utf-8")
 
         template_content = template_path.read_text(encoding="utf-8")
@@ -270,11 +224,13 @@ dependencies {
         build_content = build_content.replace("{{ app_id_lines }}", app_id_lines)
         build_content = build_content.replace("{{ min_sdk }}", str(min_sdk))
         build_content = build_content.replace("{{ target_sdk }}", str(target_sdk))
-        build_content = build_content.replace("{{ abi_filters }}", abi_filters)
+
+        build_content = build_content.replace("{{ ndk_abi_block }}", ndk_abi_block)
+        build_content = build_content.replace("{{ flavor_block }}", flavor_block)
+        build_content = build_content.replace("{{ source_sets_block }}", source_sets_block)
+
         build_content = build_content.replace("{{ extra_deps }}", extra_deps)
-        build_content = build_content.replace(
-            "{{ site_packages_tasks }}", site_packages_tasks
-        )
+        build_content = build_content.replace("{{ site_packages_tasks }}", site_packages_tasks)
 
         (app_dir / "build.gradle.kts").write_text(build_content, encoding="utf-8")
         (app_dir / "libs").mkdir(parents=True, exist_ok=True)
@@ -334,12 +290,14 @@ tasks.configureEach {{
         python_version: str,
         byte_compile_default: bool,
         uv_python: str | None = None,
+        universal_apk: bool = True,
     ) -> str:
         kt_bool = str(byte_compile_default).lower()
         # Byte-compile with a uv-managed interpreter pinned to the bundled
         # runtime's version so .pyc magic numbers match; bare python3 would
         # use whatever the host happens to have.
         uv_py = uv_python or python_version
+        is_universal_kt = str(universal_apk).lower()
         return f"""\
 abstract class OptimizePythonTask : DefaultTask() {{
     @get:Input
@@ -402,59 +360,106 @@ abstract class OptimizePythonTask : DefaultTask() {{
     }}
 }}
 
+
+val isCmdLineForced = project.hasProperty("forceCompile")
+val isReleaseBuild = gradle.startParameter.taskNames.any {{ 
+    it.contains("Release", ignoreCase = true) 
+}}
+val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
+val shouldCompileKt = isReleaseBuild || isCmdLineForced || {kt_bool}
+
+val isUniversalApk = {is_universal_kt}
 val sitePackagesAbis = listOf({arch_list_kts})
-val stagingDir = layout.buildDirectory.dir("python_assets_staging").get().asFile
 val assetsDir = layout.projectDirectory.dir("src/main/assets")
-val generatedAssetsDir = layout.buildDirectory.dir("generated/python_assets").get().asFile
 
-val stagePython = tasks.register<Copy>("stagePython") {{
-    group = "python"
+if (isUniversalApk) {{
+    val stagingDir = layout.buildDirectory.dir("python_assets_staging/universal").get().asFile
+    val generatedAssetsDir = layout.buildDirectory.dir("generated/python_assets/universal").get().asFile
 
-    from(assetsDir.dir("python{python_version}")) {{
-        into("python{python_version}")
+    val stagePython = tasks.register<Sync>("stagePython") {{
+        group = "python"
+        from(assetsDir.dir("python{python_version}")) {{ into("python{python_version}") }}
+        
+        sitePackagesAbis.forEach {{ abi ->
+            from(layout.projectDirectory.dir("../site_packages/$abi")) {{
+                exclude(".libs/**", ".java/**", ".kotlin/**", ".gradle/**")
+                into("site-packages/$abi")
+            }}
+            from(assetsDir.dir("lib-dynload/$abi")) {{ into("lib-dynload/$abi") }}
+        }}
+        into(stagingDir)
     }}
-    from(assetsDir.dir("lib-dynload")) {{
-        into("lib-dynload")
+
+    val optimizeStaged = tasks.register<OptimizePythonTask>("optimizeStaged") {{
+        group = "python"
+        dependsOn(stagePython)
+        shouldCompile.set(shouldCompileKt)
+        targetPath.set(stagingDir.absolutePath)
+        ndkDir.set(androidExt.ndkDirectory.absolutePath)
     }}
+
+    val zipPythonAssets = tasks.register<Zip>("zipPythonAssets") {{
+        group = "python"
+        dependsOn(optimizeStaged)
+        archiveFileName.set("assets.zip")
+        destinationDirectory.set(generatedAssetsDir)
+        from(stagingDir) {{ include("**/*") }}
+        entryCompression = ZipEntryCompression.DEFLATED
+    }}
+
+    tasks.named("preBuild") {{ dependsOn(zipPythonAssets) }}
+    tasks.configureEach {{
+        if (name.contains("Assets") && name != "zipPythonAssets") {{
+            dependsOn(zipPythonAssets)
+        }}
+    }}
+}} else {{
+    val zipTasks = mutableListOf<TaskProvider<Zip>>()
 
     sitePackagesAbis.forEach {{ abi ->
-        val sitePackDir = layout.projectDirectory.dir("../site_packages/$abi")
-        from(sitePackDir) {{
-            exclude(".libs/**", ".java/**", ".kotlin/**", ".gradle/**")
-            into("site-packages/$abi")
+        val flavorName = abi.replace("-", "_")
+        val stagingDir = layout.buildDirectory.dir("python_assets_staging/$abi").get().asFile
+        val generatedAssetsDir = layout.buildDirectory.dir("generated/python_assets/$abi").get().asFile
+
+        val stageTask = tasks.register<Sync>("stagePython_$abi") {{
+            group = "python"
+            from(assetsDir.dir("python{python_version}")) {{ into("python{python_version}") }}
+            from(layout.projectDirectory.dir("../site_packages/$abi")) {{
+                exclude(".libs/**", ".java/**", ".kotlin/**", ".gradle/**")
+                into("site-packages/$abi")
+            }}
+            from(assetsDir.dir("lib-dynload/$abi")) {{ into("lib-dynload/$abi") }}
+            into(stagingDir)
+        }}
+
+        val optimizeTask = tasks.register<OptimizePythonTask>("optimizeStaged_$abi") {{
+            group = "python"
+            dependsOn(stageTask)
+            shouldCompile.set(shouldCompileKt)
+            targetPath.set(stagingDir.absolutePath)
+            ndkDir.set(androidExt.ndkDirectory.absolutePath)
+        }}
+
+        val zipTask = tasks.register<Zip>("zipPythonAssets_$abi") {{
+            group = "python"
+            dependsOn(optimizeTask)
+            archiveFileName.set("assets.zip")
+            destinationDirectory.set(generatedAssetsDir)
+            from(stagingDir) {{ include("**/*") }}
+            entryCompression = ZipEntryCompression.DEFLATED
+        }}
+        zipTasks.add(zipTask)
+
+        tasks.configureEach {{
+            if (name.contains("Assets") && name.contains(flavorName, ignoreCase = true) && !name.startsWith("zipPythonAssets")) {{
+                dependsOn(zipTask)
+            }}
         }}
     }}
 
-    into(stagingDir)
-}}
-
-val optimizeStaged = tasks.register<OptimizePythonTask>("optimizeStaged") {{
-    group = "python"
-    dependsOn(stagePython)
-
-    val isCmdLineForced = project.hasProperty("forceCompile")
-    val isReleaseBuild = gradle.startParameter.taskNames.any {{ 
-        it.contains("Release", ignoreCase = true) 
+    tasks.named("preBuild") {{
+        zipTasks.forEach {{ dependsOn(it) }}
     }}
-    val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
-
-    shouldCompile.set(isReleaseBuild || isCmdLineForced || {kt_bool})
-    targetPath.set(stagingDir.absolutePath)
-    ndkDir.set(androidExt.ndkDirectory.absolutePath)
-}}
-
-val zipPythonAssets = tasks.register<Zip>("zipPythonAssets") {{
-    group = "python"
-    dependsOn(optimizeStaged)
-
-    archiveFileName.set("assets.zip")
-    destinationDirectory.set(generatedAssetsDir)
-
-    from(stagingDir) {{
-        include("**/*")
-    }}
-
-    entryCompression = ZipEntryCompression.DEFLATED
 }}
 
 tasks.register<Copy>("copySitePackagesJava") {{
@@ -491,16 +496,12 @@ val copySitePackagesNativeLibsTasks = sitePackagesAbis.map {{ abi ->
 }}
 
 tasks.named("preBuild") {{
-    dependsOn(zipPythonAssets)
     copySitePackagesNativeLibsTasks.forEach {{ dependsOn(it) }}
     dependsOn("copySitePackagesJava")
     dependsOn("copySitePackagesKotlin")
 }}
 
 tasks.configureEach {{
-    if (name.contains("Assets") && name != "zipPythonAssets") {{
-        dependsOn(zipPythonAssets)
-    }}
     if (name.startsWith("buildCMake") || name.startsWith("configureCMake") || name.startsWith("generateJsonModel")) {{
         copySitePackagesNativeLibsTasks.forEach {{ dependsOn(it) }}
     }}
@@ -553,34 +554,7 @@ tasks.configureEach {{
             print(
                 "AndroidManifest.tmpl.xml not found... Continuing with default template..."
             )
-            default_template = """\
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-{{ permissions }}
-
-    <application
-        android:label="{{ app_name }}"
-        android:icon="@mipmap/ic_launcher"
-        android:allowBackup="true"
-        android:supportsRtl="true"
-        android:hardwareAccelerated="true"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">{{ meta_data }}
-{{ services }}
-        <activity
-            android:name=".MainActivity"
-            android:label="{{ app_name }}"
-            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|fontScale|uiMode|screenSize|smallestScreenSize|layoutDirection|density|colorMode|fontWeightAdjustment|grammaticalGender"
-            android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-    </application>
-</manifest>
-"""
+            default_template = ANDROID_MANIFEST
             template_path.write_text(default_template, encoding="utf-8")
 
         template_content = template_path.read_text(encoding="utf-8")
