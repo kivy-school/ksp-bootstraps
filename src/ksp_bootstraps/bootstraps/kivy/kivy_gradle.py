@@ -10,8 +10,10 @@ from pathlib import Path
 from enum import StrEnum
 
 from ...platforms import AndroidPlatform
-from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
-from ...pyproject_models.kivy_school.gradle import AndroidProtocol
+
+from ksp_pyproject.protocols.pyproject_toml import PyProjectTomlProtocol
+from ksp_pyproject.protocols.kivy_school.gradle import AndroidProtocol
+
 from ...bootstrap import GradleProjectDelegate
 from .gradle_build_files import GradleBuildFiles
 
@@ -21,6 +23,7 @@ from .gradle_build_files import GradleBuildFiles
 class KivyGradleBuilder:
 
     delegate: GradleProjectDelegate
+    android: AndroidProtocol
 
     def __init__(self, pyproject: PyProjectTomlProtocol, delegate: GradleProjectDelegate):
         self.pyproject = pyproject
@@ -99,18 +102,17 @@ class KivyGradleBuilder:
 
         # Merge gradle dependencies and permissions from pyproject.toml with
         # those collected from site-packages .gradle/*.json files (ksp-builder).
-        base_deps = self.android.gradle_dependencies if self.android else []
-        base_perms = self.android.permissions if self.android else []
-        base_plugins = (
-            getattr(self.android, "gradle_plugins", []) if self.android else []
-        )
+        android = self.android
+        base_deps = android.gradle_dependencies
+        base_perms = android.permissions
+        base_plugins = android.gradle_plugins
 
         merged_deps = _merge_unique(base_deps, extra_gradle_dependencies or [])
         merged_perms = _merge_unique(base_perms, extra_permissions or []) # type: ignore
 
         # Extract version metadata safely out of the parsed configuration object
-        v_code = getattr(self.android, "version_code", 1) if self.android else 1
-        v_name = getattr(self.android, "version_name", "1.0") if self.android else "1.0"
+        v_code = android.version_code
+        v_name = android.version_name
 
         # Resolve toolchain first — we need the SDK path for local.properties
         #toolchain = AndroidToolchain.resolve(self.android, self.working_dir)
@@ -127,24 +129,20 @@ class KivyGradleBuilder:
         py_version = delegate.py_version
         app_dir = dist_dir / "app"
         app_dir.mkdir(parents=True, exist_ok=True)
+
+
+        compile_sdk = android.api if android.api else default_api_ver
+        min_sdk = android.min_api if android.min_api else 24
+        target_sdk = android.api if android.api else default_api_ver
+
         GradleBuildFiles.write_app_build_gradle(
             project_dir=self.working_dir,
             app_dir=app_dir,
             package_name=self.package_name,
             archs=self.archs, #type: ignore
-            compile_sdk=(
-                self.android.api
-                if self.android and self.android.api
-                else default_api_ver
-            ),
-            min_sdk=(
-                self.android.min_api if self.android and self.android.min_api else 24
-            ),
-            target_sdk=(
-                self.android.api
-                if self.android and self.android.api
-                else default_api_ver
-            ),
+            compile_sdk=compile_sdk,
+            min_sdk=min_sdk,
+            target_sdk=target_sdk,
             python_version=py_version,
             ndk_version=delegate.ndk_version,
             ndk_path=delegate.ndk_path,
@@ -152,22 +150,23 @@ class KivyGradleBuilder:
             gradle_dependencies=merged_deps,
             version_code=v_code,
             version_name=v_name,
-            post_build=(self.android.post_build if self.android else None),
-            byte_compile_default=(self.android.byte_compile_python if self.android else True),
-            uv_python=getattr(delegate, "uv_py_version", None),
-            universal_apk=(self.android.universal_apk if self.android else True)
+            post_build=android.post_build,
+            byte_compile_default=android.byte_compile_python,
+            uv_python=delegate.uv_py_version,
+            universal_apk=android.universal_apk
         )
 
         main_dir = app_dir / "src" / "main"
         main_dir.mkdir(parents=True, exist_ok=True)
+
         GradleBuildFiles.write_android_manifest(
             main_dir,
             package_name=self.package_name,
             project_dir=self.working_dir,
             app_name=self.app_name,
             permissions=merged_perms,
-            meta_data=(self.android.meta_data if self.android else {}),
-            services=(self.android.services if self.android else []), #type: ignore
+            meta_data=android.meta_data,
+            services=android.services, #type: ignore
         )
         res_dir = main_dir / "res"
         GradleBuildFiles.write_icon(res_dir, self._resolve_asset("icon"))
@@ -175,15 +174,13 @@ class KivyGradleBuilder:
         presplash_type = None
         presplash_name = None
         presplash_color = (
-            getattr(self.android, "presplash_color", "#FFFFFF")
-            if self.android
+            android.presplash_color
+            if android.presplash_color
             else "#FFFFFF"
         )
 
         # Check for Lottie first, then fallback to standard presplash image/gif
-        lottie_path = (
-            getattr(self.android, "presplash_lottie", None) if self.android else None
-        )
+        lottie_path = android.presplash_lottie
 
         if lottie_path:
             asset_src = self._resolve_asset("presplash_lottie")
@@ -222,20 +219,20 @@ class KivyGradleBuilder:
         GradleBuildFiles.write_kivy_python_activity(main_dir, self.package_name)
 
         GradleBuildFiles.write_kivy_python_service(main_dir)
-        if self.android and self.android.services:
-            for svc in self.android.services:
-                GradleBuildFiles.write_custom_service(
-                    main_dir=main_dir,
-                    package_name=self.package_name,
-                    service_name=svc.name,
-                    python_version=py_version,
-                    entrypoint=svc.entrypoint,
-                    foreground=svc.foreground,
-                    start_type=svc.start_type,
-                    notification_title=svc.notification_title,
-                    notification_text=svc.notification_text,
-                    notification_icon=svc.notification_icon,
-                )
+        
+        for svc in self.android.services:
+            GradleBuildFiles.write_custom_service(
+                main_dir=main_dir,
+                package_name=self.package_name,
+                service_name=svc.name,
+                python_version=py_version,
+                entrypoint=svc.entrypoint,
+                foreground=svc.foreground,
+                start_type=svc.start_type,
+                notification_title=svc.notification_title,
+                notification_text=svc.notification_text,
+                notification_icon=svc.notification_icon,
+            )
 
         GradleBuildFiles.write_generic_broadcast_receiver_callback(main_dir)
         GradleBuildFiles.write_generic_broadcast_receiver(main_dir)
@@ -332,51 +329,51 @@ class KivyGradleBuilder:
         # ------------------------------------------------------------------
         # Process include_files (e.g. google-services.json, *.json)
         # ------------------------------------------------------------------
-        if self.android and self.android.include_files:
-            for dest_str, sources in self.android.include_files:
-                # Resolve destination relative to the project_dist folder
-                dest_base = self.working_dir / "project_dist"
-                target_dir = dest_base / dest_str
-                target_dir.mkdir(parents=True, exist_ok=True)
+        
+        for dest_str, sources in self.android.include_files:
+            # Resolve destination relative to the project_dist folder
+            dest_base = self.working_dir / "project_dist"
+            target_dir = dest_base / dest_str
+            target_dir.mkdir(parents=True, exist_ok=True)
 
-                for src_str in sources:
-                    # Check if the source string contains wildcard characters
-                    if "*" in src_str or "?" in src_str:
-                        if Path(src_str).is_absolute():
-                            import glob
+            for src_str in sources:
+                # Check if the source string contains wildcard characters
+                if "*" in src_str or "?" in src_str:
+                    if Path(src_str).is_absolute():
+                        import glob
 
-                            paths_to_copy = [Path(p) for p in glob.glob(src_str)]
-                        else:
-                            paths_to_copy = list(self.working_dir.glob(src_str))
-
-                        if not paths_to_copy:
-                            print(
-                                f"[ksproject] Warning: No files matched include_file pattern: {src_str}"
-                            )
-                            continue
+                        paths_to_copy = [Path(p) for p in glob.glob(src_str)]
                     else:
-                        src_path = Path(src_str)
-                        if not src_path.is_absolute():
-                            src_path = self.working_dir / src_path
+                        paths_to_copy = list(self.working_dir.glob(src_str))
 
-                        if not src_path.exists():
-                            print(
-                                f"[ksproject] Warning: include_file source not found: {src_path}"
-                            )
-                            continue
-                        paths_to_copy = [src_path]
-
-                    # Copy all resolved paths (whether 1 explicit file or multiple glob matches)
-                    for path in paths_to_copy:
-                        if path.is_dir():
-                            shutil.copytree(
-                                path, target_dir / path.name, dirs_exist_ok=True
-                            )
-                        else:
-                            shutil.copy2(path, target_dir / path.name)
+                    if not paths_to_copy:
                         print(
-                            f"[ksproject] Copied include_file: {path.name} -> {target_dir}"
+                            f"[ksproject] Warning: No files matched include_file pattern: {src_str}"
                         )
+                        continue
+                else:
+                    src_path = Path(src_str)
+                    if not src_path.is_absolute():
+                        src_path = self.working_dir / src_path
+
+                    if not src_path.exists():
+                        print(
+                            f"[ksproject] Warning: include_file source not found: {src_path}"
+                        )
+                        continue
+                    paths_to_copy = [src_path]
+
+                # Copy all resolved paths (whether 1 explicit file or multiple glob matches)
+                for path in paths_to_copy:
+                    if path.is_dir():
+                        shutil.copytree(
+                            path, target_dir / path.name, dirs_exist_ok=True
+                        )
+                    else:
+                        shutil.copy2(path, target_dir / path.name)
+                    print(
+                        f"[ksproject] Copied include_file: {path.name} -> {target_dir}"
+                    )
 
         print(f"Gradle project generated at: {dist_dir}")
         print(f"  app/src/main/jniLibs/<abi> — libpython + extension .so per ABI")

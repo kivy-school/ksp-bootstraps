@@ -2,7 +2,8 @@
 
 from .kivy import KivyBootstrap
 from ..bootstrap import BootstrapProtocol, ProjectDelegate
-from ..pyproject_models.pyproject_toml import PyProjectTomlProtocol
+#from ....pyproject_models.pyproject_toml import PyProjectTomlProtocol
+from ksp_pyproject.protocols.pyproject_toml import PyProjectTomlProtocol
 
 class BootstrapError(Exception):
 

@@ -1,6 +1,6 @@
 from ksp_bootstraps.bootstrap import BootstrapProtocol
-from ksp_bootstraps.pyproject_models.pyproject_toml import KivySchoolProtocol, AndroidProtocol, IosProtocol, MacOSProtocol
-from ksproject_utils.pyproject_toml import PyProjectToml
+from pyproject_models.pyproject_toml import KivySchoolProtocol, AndroidProtocol, IosProtocol, MacOSProtocol
+from ksp_pyproject.data.pyproject_toml import PyProjectToml
 
 from ksp_bootstraps.bootstraps.kivy import KivyBootstrap
 

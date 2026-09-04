@@ -1,8 +1,11 @@
 from typing import Protocol, Generic
 from pathlib import Path
 
-from .kivy_school.apple import MacOSProtocol, IosProtocol, AppleProtocol
-from .kivy_school.gradle import AndroidProtocol
+
+#from .kivy_school.apple import MacOSProtocol, IosProtocol, AppleProtocol
+from ksp_pyproject.protocols.kivy_school.apple import MacOSProtocol, IosProtocol, AppleProtocol
+#from .kivy_school.gradle import AndroidProtocol
+from ksp_pyproject.protocols.kivy_school.gradle import AndroidProtocol
 
 class PyProjectProtocol(Protocol):
 

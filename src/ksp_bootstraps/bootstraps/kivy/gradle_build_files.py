@@ -13,8 +13,8 @@ from enum import StrEnum
 
 # from ksproject_utils.pyproject_toml import KivySchoolData
 # from ksproject_utils.gradle.android_toolchain import DEFAULT_API_VERSION
-from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
-from ...pyproject_models.pyproject_toml import KivySchoolProtocol, AndroidProtocol
+from .....pyproject_models.pyproject_toml import PyProjectTomlProtocol
+from .....pyproject_models.pyproject_toml import KivySchoolProtocol, AndroidProtocol
 from ksp_bootstraps.gradle.build_gradle_template import BUILD_GRADLE
 from ksp_bootstraps.gradle.android_manifest_template import ANDROID_MANIFEST
 

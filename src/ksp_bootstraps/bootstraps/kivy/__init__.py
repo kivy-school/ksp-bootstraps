@@ -2,9 +2,9 @@ from ksp_bootstraps.bootstrap import BootstrapProtocol, ProjectDelegate, XcodePr
 from .kivy_gradle import KivyGradleBuilder
 from .kivy_xcode import KivyXcodeBuilder
 from ...platforms import Platform
-from ...pyproject_models.pyproject_toml import PyProjectTomlProtocol
-from ...pyproject_models.kivy_school.apple import MacOSProtocol, IosProtocol
-from ...pyproject_models.kivy_school.gradle import AndroidProtocol
+from .....pyproject_models.pyproject_toml import PyProjectTomlProtocol
+from .....pyproject_models.kivy_school.apple import MacOSProtocol, IosProtocol
+from .....pyproject_models.kivy_school.gradle import AndroidProtocol
 from pathlib import Path
 
 

@@ -8,9 +8,13 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "ksp-pyproject",
     "pyyaml>=6.0.3",
 ]
 
 [build-system]
 requires = ["uv_build>=0.11.14,<0.12.0"]
 build-backend = "uv_build"
+
+[tool.uv.sources]
+ksp-pyproject = { path = "../ksp-pyproject" }

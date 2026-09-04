@@ -11,7 +11,7 @@ import yaml
 
 from ksp_bootstraps.platforms import ApplePlatform
 # from ..pyproject_toml import PyProjectToml
-from ksp_bootstraps.pyproject_models.pyproject_toml import PyProjectTomlProtocol
+from ksp_pyproject.protocols.pyproject_toml import PyProjectTomlProtocol
 from ksp_bootstraps.xcode.xcodegen_runner import XcodeGenProtocol
 from ksp_bootstraps.xcode.main_files import render_main_swift
 from ksp_bootstraps.xcode.plist_templates import STDLIB_PLIST_XML
