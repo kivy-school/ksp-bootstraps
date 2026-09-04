@@ -13,8 +13,9 @@ from enum import StrEnum
 
 # from ksproject_utils.pyproject_toml import KivySchoolData
 # from ksproject_utils.gradle.android_toolchain import DEFAULT_API_VERSION
-from .....pyproject_models.pyproject_toml import PyProjectTomlProtocol
-from .....pyproject_models.pyproject_toml import KivySchoolProtocol, AndroidProtocol
+from ksp_pyproject.protocols.pyproject_toml import PyProjectTomlProtocol
+from ksp_pyproject.protocols.pyproject_toml import KivySchoolProtocol, AndroidProtocol
+from ksp_pyproject.protocols.kivy_school.gradle import ServiceData
 from ksp_bootstraps.gradle.build_gradle_template import BUILD_GRADLE
 from ksp_bootstraps.gradle.android_manifest_template import ANDROID_MANIFEST
 
@@ -520,7 +521,7 @@ tasks.configureEach {{
         app_name: str,
         permissions: list[str] | None = None,
         meta_data: dict[str, str] | None = None,
-        services: list["AndroidProtocol.ServiceData"] | None = None,
+        services: list[ServiceData] | None = None,
     ) -> None:
 
         perm_lines = "\n".join(
